@@ -9,6 +9,19 @@ import supabase as _sb
 st.sidebar.caption(f"supabase-py version: {_sb.__version__}")
 
 # --- DEBUG: Supabase connection test ---
+
+from supabase import create_client
+from supabase.client import ClientOptions
+
+try:
+    supa_test = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_ANON_KEY"], options=ClientOptions())
+    res = supa_test.table("document_chunks").select("id", count="exact").limit(1).execute()
+    st.sidebar.success(f"✅ Supabase connected. document_chunks rows: {res.count}")
+except Exception as e:
+    st.sidebar.error(f"❌ Supabase connection failed: {e}")
+
+
+
 from supabase import create_client, Client
 from supabase.client import ClientOptions
 
