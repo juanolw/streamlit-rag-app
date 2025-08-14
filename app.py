@@ -1,11 +1,13 @@
-# app.py — Single-page RAG flow (no tabs)
+# app.py — Single-page RAG with enhanced OCR + options
 import io
+import os
 import time
 import numpy as np
 import streamlit as st
 import fitz  # PyMuPDF
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
+from pathlib import Path
 
 # Embeddings + DB
 from sentence_transformers import SentenceTransformer
@@ -14,7 +16,7 @@ from supabase.client import ClientOptions
 import supabase as _sb
 
 st.set_page_config(page_title="RAG: PDF → Embeddings → Search", layout="wide")
-st.title("RAG App: PDF Upload → Embeddings → Search")
+st.title("RAG App: PDF Upload → Embeddings → Search (Enhanced OCR)")
 
 # ================== Sidebar Setup Checks ==================
 with st.sidebar:
@@ -54,20 +56,63 @@ def load_embedding_model():
     # 384-dim sentence embeddings (free, lightweight)
     return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-# ================== Helpers ==================
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Whole-document text; OCR fallback per page."""
+# ================== OCR Helper ==================
+def ocr_from_page(page, zoom=3.0, lang="eng", psm="6",
+                  do_denoise=True, do_autocontrast=True,
+                  binarize=True, thresh=180, user_words_path=None):
+    """
+    Higher-quality OCR for a single PDF page:
+    - Renders at higher DPI (zoom 3.0 ≈ ~216 DPI; 4.0 ≈ ~288 DPI).
+    - Optional denoise + autocontrast + binarize to sharpen text.
+    - Tesseract tuned with configurable PSM (page segmentation mode).
+    """
+    # 1) Render page at higher resolution for better character shapes
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)  # no alpha channel
+    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("L")  # grayscale
+
+    # 2) Preprocessing
+    if do_denoise:
+        img = img.filter(ImageFilter.MedianFilter(size=3))
+    if do_autocontrast:
+        img = ImageOps.autocontrast(img)
+    if binarize:
+        # simple global threshold; tweak (140–220) per doc quality
+        img = img.point(lambda p: 255 if p > thresh else 0)
+
+    # 3) Tesseract config
+    # --oem 1 = LSTM engine, --psm X controls layout assumptions
+    config = f"--oem 1 --psm {psm} -c preserve_interword_spaces=1"
+    if user_words_path:
+        config += f" --user-words {user_words_path}"
+
+    text = pytesseract.image_to_string(img, lang=lang, config=config)
+    return (text or "").strip()
+
+# ================== Extractors ==================
+def extract_text_from_pdf(file_bytes, ocr_opts, force_ocr=False):
+    """Whole-document text; per-page OCR fallback or force OCR."""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     parts = []
     total = len(doc)
     prog = st.progress(0, text=f"Extracting text 0/{total} pages...")
     for i, page in enumerate(doc):
         try:
-            text = (page.get_text() or "").strip()
+            text = ""
+            if not force_ocr:
+                text = (page.get_text() or "").strip()
             if not text:
-                pix = page.get_pixmap()
-                img = Image.open(io.BytesIO(pix.tobytes("png")))
-                text = (pytesseract.image_to_string(img) or "").strip()
+                text = ocr_from_page(
+                    page,
+                    zoom=ocr_opts["zoom"],
+                    lang=ocr_opts["lang"],
+                    psm=ocr_opts["psm"],
+                    do_denoise=ocr_opts["do_denoise"],
+                    do_autocontrast=ocr_opts["do_autocontrast"],
+                    binarize=ocr_opts["binarize"],
+                    thresh=ocr_opts["thresh"],
+                    user_words_path=ocr_opts["user_words_path"]
+                )
             parts.append(text)
         except Exception as e:
             parts.append(f"[Error reading page {i+1}: {e}]")
@@ -76,18 +121,28 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
     doc.close()
     return "\n\n--- PAGE BREAK ---\n\n".join(parts).strip()
 
-def extract_pages_with_metadata(file_bytes: bytes, document_name: str):
-    """One chunk per page with {document_name, page_number, text} (OCR fallback)."""
+def extract_pages_with_metadata(file_bytes, document_name, ocr_opts, force_ocr=False):
+    """One chunk per page with {document_name, page_number, text}."""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     total = len(doc)
     pages = []
     prog = st.progress(0, text=f"Splitting into page chunks 0/{total}...")
     for i, page in enumerate(doc):
-        text = (page.get_text() or "").strip()
+        text = ""
+        if not force_ocr:
+            text = (page.get_text() or "").strip()
         if not text:
-            pix = page.get_pixmap()
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            text = (pytesseract.image_to_string(img) or "").strip()
+            text = ocr_from_page(
+                page,
+                zoom=ocr_opts["zoom"],
+                lang=ocr_opts["lang"],
+                psm=ocr_opts["psm"],
+                do_denoise=ocr_opts["do_denoise"],
+                do_autocontrast=ocr_opts["do_autocontrast"],
+                binarize=ocr_opts["binarize"],
+                thresh=ocr_opts["thresh"],
+                user_words_path=ocr_opts["user_words_path"]
+            )
         pages.append({
             "document_name": document_name,
             "page_number": i + 1,
@@ -97,12 +152,60 @@ def extract_pages_with_metadata(file_bytes: bytes, document_name: str):
     doc.close()
     return pages
 
-def embed_texts(model: SentenceTransformer, texts: list[str]) -> np.ndarray:
+# ================== Embeddings ==================
+def embed_texts(model, texts):
     """Return L2-normalized embeddings (n x 384)."""
     emb = model.encode(texts, batch_size=32, show_progress_bar=True)
     emb = np.asarray(emb, dtype=np.float32)
     emb /= (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
     return emb
+
+# ================== OCR Options UI ==================
+with st.expander("⚙️ OCR Options (tune if extraction is wrong)", expanded=False):
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        zoom = st.slider("Render zoom (DPI proxy)", 2.0, 4.0, 3.0, 0.5,
+                         help="Higher → sharper OCR but slower (2≈144DPI, 3≈216DPI, 4≈288DPI).")
+        psm_choice = st.selectbox(
+            "Tesseract PSM (layout mode)",
+            options=[("6 - single uniform block (default)", "6"),
+                     ("4 - single column of text", "4"),
+                     ("3 - fully automatic", "3"),
+                     ("11 - sparse text", "11"),
+                     ("12 - sparse text with OSD", "12")],
+            index=0, format_func=lambda x: x[0]
+        )[1]
+    with col2:
+        lang = st.text_input("Language code", "eng",
+                             help="Install extra packs in packages.txt (e.g., tesseract-ocr-fra).")
+        do_denoise = st.checkbox("Denoise (median)", True)
+        do_autocontrast = st.checkbox("Auto-contrast", True)
+    with col3:
+        binarize = st.checkbox("Binarize (black/white)", True)
+        thresh = st.slider("Binarize threshold", 140, 220, 180, 1)
+        force_ocr = st.checkbox("Force OCR on all pages", False,
+                                help="Ignore embedded text and OCR everything.")
+
+    # Optional custom vocabulary (.txt, one term per line)
+    user_words_file = st.file_uploader("Optional: custom vocabulary file (user_words.txt)", type=["txt"])
+    user_words_path = None
+    if user_words_file is not None:
+        # Save to a temp path in the working directory
+        user_words_path = Path("user_words.txt").absolute()
+        with open(user_words_path, "wb") as f:
+            f.write(user_words_file.read())
+        st.caption(f"Custom vocabulary saved to {user_words_path}")
+
+ocr_opts = {
+    "zoom": float(zoom),
+    "lang": lang.strip() or "eng",
+    "psm": psm_choice,
+    "do_denoise": do_denoise,
+    "do_autocontrast": do_autocontrast,
+    "binarize": binarize,
+    "thresh": int(thresh),
+    "user_words_path": str(user_words_path) if user_words_path else None
+}
 
 # ================== STEP 1: Upload & Extract ==================
 st.header("Step 1: Upload & Extract")
@@ -114,8 +217,8 @@ if uploaded_file:
         with st.spinner("Processing..."):
             try:
                 file_bytes = uploaded_file.read()
-                full_text = extract_text_from_pdf(file_bytes)
-                page_chunks = extract_pages_with_metadata(file_bytes, uploaded_file.name)
+                full_text = extract_text_from_pdf(file_bytes, ocr_opts, force_ocr=force_ocr)
+                page_chunks = extract_pages_with_metadata(file_bytes, uploaded_file.name, ocr_opts, force_ocr=force_ocr)
                 st.session_state["pages"] = page_chunks
                 st.session_state["document_name"] = uploaded_file.name
 
@@ -143,8 +246,23 @@ elif "pages" not in st.session_state or not st.session_state["pages"]:
 else:
     st.write(f"Pages ready to index: **{len(st.session_state['pages'])}** "
              f"(from **{st.session_state.get('document_name','unknown')}**)")
+    colA, colB = st.columns(2)
+    with colA:
+        delete_first = st.checkbox("Delete existing rows for this document before upload", False)
+    with colB:
+        st.caption("Check to avoid duplicates if re-indexing the same PDF.")
+
     if st.button("2) Generate embeddings & upload", type="primary"):
         try:
+            if delete_first:
+                try:
+                    _ = _supa.rpc("delete_document", {"p_document_name": st.session_state.get("document_name", "")}).execute()
+                    st.info("Old rows for this document deleted (if any).")
+                except Exception:
+                    # helper may not exist; fall back to raw delete
+                    _supa.table("document_chunks").delete().eq("document_name", st.session_state.get("document_name", "")).execute()
+                    st.info("Old rows deleted via fallback.")
+
             model = load_embedding_model()
             pages = st.session_state["pages"]
             texts = [p["text"] if p["text"] else "" for p in pages]
@@ -188,24 +306,32 @@ st.header("Step 3: Search (Keyword / Semantic)")
 if not _supa:
     st.info("Configure Supabase first to enable search.")
 else:
+    # Optional: filter by document
+    try:
+        docs = _supa.table("document_chunks").select("document_name").execute()
+        doc_names = sorted({r["document_name"] for r in (docs.data or []) if r.get("document_name")})
+    except Exception:
+        doc_names = []
+    selected_doc = st.selectbox("Limit to document (optional)", ["All"] + doc_names)
+
     query = st.text_input("Enter your query")
     mode = st.radio("Search type", ["Keyword (exact text match)", "Semantic (meaning match)"])
     top_k = st.slider("Results to show", 1, 20, 5)
 
-    colA, colB = st.columns(2)
-    with colA:
+    # Quick checks
+    c1, c2 = st.columns(2)
+    with c1:
         if st.button("Check row count"):
             try:
                 res = _supa.table("document_chunks").select("id", count="exact").limit(1).execute()
                 st.write(f"Row count: {res.count}")
             except Exception as e:
                 st.error(f"Count failed: {e}")
-    with colB:
+    with c2:
         if st.button("Show 3 most recent rows"):
             try:
-                res = _supa.table("document_chunks") \
-                           .select("document_name,page_number,text") \
-                           .order("id", desc=True).limit(3).execute()
+                q = _supa.table("document_chunks").select("document_name,page_number,text").order("id", desc=True).limit(3)
+                res = q.execute()
                 st.write(res.data)
             except Exception as e:
                 st.error(f"Preview failed: {e}")
@@ -217,20 +343,29 @@ else:
             try:
                 results = []
                 if mode.startswith("Keyword"):
-                    res = _supa.table("document_chunks") \
-                               .select("document_name,page_number,text") \
-                               .ilike("text", f"%{query}%") \
-                               .limit(top_k).execute()
+                    q = _supa.table("document_chunks").select("document_name,page_number,text").ilike("text", f"%{query}%")
+                    if selected_doc != "All":
+                        q = q.eq("document_name", selected_doc)
+                    res = q.limit(top_k).execute()
                     results = getattr(res, "data", []) or []
                 else:
-                    # Semantic: embed query, call RPC (ensure it exists in Supabase)
+                    # Semantic: embed query, call RPC(s)
                     model = load_embedding_model()
-                    q = model.encode([query])[0].astype(np.float32)
-                    q /= (np.linalg.norm(q) + 1e-12)
-                    res = _supa.rpc("find_similar_chunks", {
-                        "query_embedding": q.tolist(),
-                        "match_count": top_k
-                    }).execute()
+                    qv = model.encode([query])[0].astype(np.float32)
+                    qv /= (np.linalg.norm(qv) + 1e-12)
+
+                    if selected_doc == "All":
+                        res = _supa.rpc("find_similar_chunks", {
+                            "query_embedding": qv.tolist(),
+                            "match_count": top_k
+                        }).execute()
+                    else:
+                        # filtered RPC (created in the full SQL I gave you)
+                        res = _supa.rpc("find_similar_chunks_in_doc", {
+                            "doc_name": selected_doc,
+                            "query_embedding": qv.tolist(),
+                            "match_count": top_k
+                        }).execute()
                     results = getattr(res, "data", []) or []
 
                 if not results:
@@ -254,5 +389,5 @@ with st.expander("Free-tier tips"):
         "- Supabase free DB is ~500 MB; fine for thousands of pages.\n"
         "- If inserts fail, check **RLS** (disable, or add anon SELECT/INSERT policies).\n"
         "- This app sleeps when idle; no cost while dormant.\n"
-        "- Embedding model is small and free (HF). Large PDFs will be slower."
+        "- If OCR is still off, raise **zoom** to 4.0 or try **PSM 4** (single column)."
     )
