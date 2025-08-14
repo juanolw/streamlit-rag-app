@@ -1,9 +1,8 @@
-# app.py — Clean UI: Tabs = Ingest | Search | QA
+# app.py — Clean UI (bigger tabs, KPI cards, clearer QA) + your existing pipeline
 # Pipeline: PDF → OCR (auto-QA) → normalize → embed → Supabase → search
 # Notes:
-# - No use of 'asc=' anywhere (compatible with supabase-py >=2.5).
-# - QA metrics & thresholds auto-flag weak pages during ingestion.
-# - Sidebar holds OCR options to keep main UI uncluttered.
+# - No 'asc=' anywhere (works with supabase-py >= 2.5).
+# - Adds CSS for modern look, QA KPI cards, how-to, and a small chart.
 
 import io
 import re
@@ -30,8 +29,51 @@ try:
 except Exception:
     partial_ratio = None
 
-BUILD_ID = "tabs-clean-qa-2025-08-14"
-st.set_page_config(page_title="RAG (Clean UI: Ingest | Search | QA)", layout="wide")
+BUILD_ID = "ui-polish-tabs-kpis-qahelp-2025-08-14"
+st.set_page_config(page_title="RAG (Ingest | Search | QA)", layout="wide")
+
+# ---------------- Global CSS (tabs, cards, badges) ----------------
+st.markdown(
+    """
+<style>
+/* Bigger, pill-style tabs */
+.stTabs [role="tab"] {
+  background-color: var(--secondary-background-color);
+  padding: 10px 18px;
+  margin-right: 8px;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 1rem;
+  border: 1px solid rgba(49,51,63,0.18);
+}
+.stTabs [role="tab"][aria-selected="true"] {
+  background: linear-gradient(135deg, #2563eb, #7c3aed);
+  color: white;
+  border-color: transparent;
+}
+.stTabs [role="tab"]:hover {
+  border-color: rgba(49,51,63,0.35);
+}
+
+/* KPI cards */
+.kpi-card { 
+  border-radius: 16px; 
+  padding: 14px 16px; 
+  background: var(--secondary-background-color); 
+  border: 1px solid rgba(49,51,63,0.15);
+}
+.kpi-title { font-size: 0.85rem; color: rgba(49,51,63,0.75); margin-bottom: 6px; }
+.kpi-value { font-size: 1.6rem; font-weight: 700; }
+
+/* Badges */
+.badge { display:inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 600; font-size: 0.75rem; }
+.badge--ok   { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; }
+.badge--warn { background:#fff7ed; color:#9a3412; border:1px solid #fed7aa; }
+.badge--err  { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 # ---------------- Sidebar: environment & OCR options ----------------
 with st.sidebar:
@@ -44,7 +86,6 @@ with st.sidebar:
     except Exception:
         st.caption("Tesseract language list unavailable")
 
-    # OCR options (global; apply in Ingest and QA re-OCR)
     preset = st.selectbox(
         "Language preset",
         ["English (printed)", "English (handwritten)", "Arabic (ara)", "Chinese (Simplified)", "Chinese (Traditional)"],
@@ -55,7 +96,7 @@ with st.sidebar:
     timeout_sec = st.slider("OCR timeout per page (sec)", 5, 60, 20)
     use_trocr = st.checkbox("Use TrOCR for English (handwritten)", value=False)
 
-    # Optional vocabulary file (.txt) — helps with domain terms
+    # Optional domain vocabulary
     user_words_path = None
     use_vocab = st.checkbox("Use custom vocabulary (.txt)", value=False)
     if use_vocab:
@@ -88,7 +129,7 @@ if _supa:
         st.sidebar.error(f"❌ Supabase connection failed: {e}")
 
 # ---------------- Normalization helpers ----------------
-ZW_REMOVE = dict.fromkeys(map(ord, "\u00ad\u200b\u200c\u200d\ufeff"), None)  # soft hyphen + zero-width
+ZW_REMOVE = dict.fromkeys(map(ord, "\u00ad\u200b\u200c\u200d\ufeff"), None)
 PUNCT_MAP = str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"', "–": "-", "—": "-", "\u00A0": " ", "·": " "})
 _PUNCT_STRIP_RE = re.compile(r"[.,:;|/\\()\[\]{}<>•·…]+")
 _SPACE_COLLAPSE_RE = re.compile(r"\s+")
@@ -438,7 +479,7 @@ with tab_ingest:
                 texts = [p["text"] if p["text"] else "" for p in pages]
 
                 st.info("Generating embeddings…")
-                emb = embed_texts(model, texts)  # (n, 384)
+                emb = embed_texts(model, texts)
 
                 rows = []
                 for p, vec in zip(pages, emb):
@@ -558,7 +599,6 @@ with tab_search:
                             rpc_ok = False
 
                         if not rpc_ok:
-                            # local fallback
                             fetched = []
                             offset = 0
                             page_size = 1000
@@ -580,7 +620,6 @@ with tab_search:
                             results = local_fuzzy_search(fetched, query, top_k=top_k)
 
                     else:
-                        # Semantic
                         model = load_embedding_model()
                         qv = model.encode([query])[0].astype(np.float32)
                         qv /= (np.linalg.norm(qv) + 1e-12)
@@ -637,21 +676,57 @@ with tab_search:
 
 # ---------------- Tab: QA ----------------
 with tab_qa:
-    st.subheader("QA Dashboard")
+    st.subheader("Quality Assurance")
 
     if not _supa:
         st.info("Configure Supabase first.")
     else:
-        # Top line controls
-        try:
-            docs = _supa.table("document_chunks").select("document_name").execute()
-            qa_doc_names = sorted({r["document_name"] for r in (docs.data or []) if r.get("document_name")})
-        except Exception:
-            qa_doc_names = []
+        # Top How-To (kept concise)
+        st.info(
+            "How to use QA:\n"
+            "1) Pick a document (or 'All') and a minimum confidence.\n"
+            "2) Click **List flagged pages** to see what needs attention.\n"
+            "3) Export CSV for triage, or run **Re-OCR flagged pages** for the **last uploaded PDF**.\n"
+            "4) Use **Single-page Inspector** for a precise fix."
+        )
 
+        # KPI row
+        try:
+            docs_res = _supa.table("document_chunks").select("document_name").execute()
+            all_docs = sorted({r["document_name"] for r in (docs_res.data or []) if r.get("document_name")})
+        except Exception:
+            all_docs = []
+
+        try:
+            total_pages = _supa.table("document_chunks").select("id", count="exact").limit(1).execute().count or 0
+            flagged_pages = _supa.table("document_chunks").select("id", count="exact").or_("avg_conf.lt.65,text_len.lte.10").limit(1).execute().count or 0
+        except Exception:
+            total_pages, flagged_pages = 0, 0
+
+        pass_rate = (100.0 * (max(total_pages - flagged_pages, 0) / total_pages)) if total_pages else 0.0
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.markdown('<div class="kpi-card"><div class="kpi-title">Documents</div>'
+                        f'<div class="kpi-value">{len(all_docs)}</div></div>', unsafe_allow_html=True)
+        with c2:
+            st.markdown('<div class="kpi-card"><div class="kpi-title">Pages Indexed</div>'
+                        f'<div class="kpi-value">{total_pages}</div></div>', unsafe_allow_html=True)
+        with c3:
+            st.markdown('<div class="kpi-card"><div class="kpi-title">Flagged Pages</div>'
+                        f'<div class="kpi-value">{flagged_pages}</div></div>', unsafe_allow_html=True)
+        with c4:
+            badge_class = "badge--ok" if pass_rate >= 90 else ("badge--warn" if pass_rate >= 70 else "badge--err")
+            st.markdown('<div class="kpi-card"><div class="kpi-title">Pass Rate</div>'
+                        f'<div class="kpi-value">{pass_rate:.1f}%</div>'
+                        f'<span class="badge {badge_class}">quality</span></div>', unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # Controls for listing flagged
         colq1, colq2, colq3 = st.columns([2,1,1])
         with colq1:
-            sel_doc = st.selectbox("Filter by doc (optional)", ["All"] + qa_doc_names, key="qa_doc")
+            sel_doc = st.selectbox("Filter by doc (optional)", ["All"] + all_docs, key="qa_doc")
         with colq2:
             min_conf = st.slider("Min conf", 0, 100, 65, key="qa_conf")
         with colq3:
@@ -664,7 +739,6 @@ with tab_qa:
                 )
                 if sel_doc != "All":
                     q = q.eq("document_name", sel_doc)
-                # Treat as flagged if it fails conf/length thresholds
                 q = q.or_(f"avg_conf.lt.{min_conf},text_len.lte.10")
                 q = q.order("document_name").order("page_number").limit(5000)
                 res = q.execute()
@@ -676,21 +750,28 @@ with tab_qa:
                     st.dataframe(df, use_container_width=True)
                     csv = df.to_csv(index=False).encode("utf-8")
                     st.download_button("Download CSV", data=csv, file_name="ocr_flagged_pages.csv", mime="text/csv")
+
+                    # Small chart: top flagged docs
+                    try:
+                        top_counts = df["document_name"].value_counts().head(15)
+                        st.markdown("**Top flagged documents**")
+                        st.bar_chart(top_counts)
+                    except Exception:
+                        pass
             except Exception as e:
                 st.error("QA query failed.")
                 st.exception(e)
 
         st.markdown("---")
-        st.subheader("Batch re-OCR the last uploaded PDF’s flagged pages")
-        st.caption("Upload the PDF in **Ingest → Process PDF** so the app holds its bytes, then run this.")
+        st.subheader("Batch re-OCR flagged pages (last uploaded PDF)")
+        st.caption("Upload & Process the PDF in **Ingest** first so the app holds its bytes.")
         if st.button("Re-OCR flagged pages now", key="qa_reocr"):
             try:
                 docname = st.session_state.get("last_pdf_name")
                 file_bytes = st.session_state.get("last_pdf_bytes")
                 if not docname or not file_bytes:
-                    st.warning("No PDF in memory. Go to Ingest, process the PDF, then return.")
+                    st.warning("No PDF in memory. Go to Ingest → Process PDF, then return.")
                 else:
-                    # Get flagged pages for that doc
                     q = (_supa.table("document_chunks")
                          .select("id,page_number")
                          .eq("document_name", docname)
