@@ -322,7 +322,9 @@ else:
 
     query = st.text_input("Enter your query")
     mode = st.radio("Search type", ["Keyword (exact text match)", "Semantic (meaning match)"])
-    top_k = st.slider("Results to show", 1, 20, 5)
+    # show more by default
+    top_k = st.slider("Results to show (when not returning all)", 5, 200, 50)
+    fetch_all = st.checkbox("Return all keyword matches (may be slower)")
 
     # Quick checks
     c1, c2 = st.columns(2)
@@ -348,12 +350,39 @@ else:
         else:
             try:
                 results = []
+                total = None
+
                 if mode.startswith("Keyword"):
-                    q = _supa.table("document_chunks").select("document_name,page_number,text").ilike("text", f"%{query}%")
+                    # Base query with count
+                    base = _supa.table("document_chunks") \
+                                .select("document_name,page_number,text", count="exact") \
+                                .ilike("text", f"%{query}%")
                     if selected_doc != "All":
-                        q = q.eq("document_name", selected_doc)
-                    res = q.limit(top_k).execute()
-                    results = getattr(res, "data", []) or []
+                        base = base.eq("document_name", selected_doc)
+
+                    if fetch_all:
+                        # Fetch ALL matches in pages of 100
+                        page_size = 100
+                        # First page (also gives us count)
+                        first = base.order("document_name", asc=True).range(0, page_size - 1).execute()
+                        total = getattr(first, "count", None)
+                        results.extend(first.data or [])
+
+                        # Fetch remaining pages
+                        offset = page_size
+                        while total is not None and offset < total:
+                            res = base.order("document_name", asc=True).range(offset, min(offset + page_size - 1, total - 1)).execute()
+                            results.extend(res.data or [])
+                            offset += page_size
+                    else:
+                        res = base.order("document_name", asc=True).limit(top_k).execute()
+                        results = getattr(res, "data", []) or []
+                        total = getattr(res, "count", None)
+
+                    # Order nicely: by document then page number
+                    results.sort(key=lambda r: (r.get("document_name",""), r.get("page_number") or 0))
+
+                    st.write(f"Matches found: {total if total is not None else len(results)}")
                 else:
                     # Semantic: embed query, call RPC(s)
                     model = load_embedding_model()
@@ -366,14 +395,17 @@ else:
                             "match_count": top_k
                         }).execute()
                     else:
-                        # filtered RPC (created in the full SQL I gave you)
                         res = _supa.rpc("find_similar_chunks_in_doc", {
                             "doc_name": selected_doc,
                             "query_embedding": qv.tolist(),
                             "match_count": top_k
                         }).execute()
-                    results = getattr(res, "data", []) or []
 
+                    results = getattr(res, "data", []) or []
+                    # For semantic results, order by doc then page for readability
+                    results.sort(key=lambda r: (r.get("document_name",""), r.get("page_number") or 0))
+
+                # Render results
                 if not results:
                     st.info("No results found.")
                 else:
@@ -385,6 +417,7 @@ else:
                         st.markdown(f"**{i}. {doc} — Page {page}**")
                         st.write(snippet or "_(empty page)_")
                         st.divider()
+
             except Exception as e:
                 st.error("Search failed.")
                 st.exception(e)
