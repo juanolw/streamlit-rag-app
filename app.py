@@ -453,24 +453,34 @@ with tab_ingest:
 
     colA, colB, colC = st.columns([1.2, 1, 1])
     with colA:
-        quiet_mode = st.toggle("Quiet mode (summaries only)", value=True,
-                               help="If on, the app won’t print page text; you’ll get a compact report instead.")
+        quiet_mode = st.toggle(
+            "Quiet mode (summaries only)", value=True,
+            help="If on, the app won’t print page text; you’ll get a compact report instead."
+        )
     with colB:
-        limit_preview = st.slider("Preview pages per doc", 0, 3, 1,
-                                  help="How many pages to show per doc (inside its expander). Set 0 to show none.")
+        limit_preview = st.slider(
+            "Preview pages per doc", 0, 3, 1,
+            help="How many pages to show per doc (inside its expander). Set 0 to show none."
+        )
     with colC:
         max_pages_each = st.number_input("Limit pages per doc (0 = all)", min_value=0, value=0, step=1)
 
     colD, colE, colF = st.columns([1.2, 1, 1])
     with colD:
-        auto_upload = st.checkbox("Auto-embed & upload to Supabase", value=True,
-                                  help="After OCR, immediately embed and upload in batches. Recommended.")
+        auto_upload = st.checkbox(
+            "Auto-embed & upload to Supabase", value=True,
+            help="After OCR, immediately embed and upload in batches. Recommended."
+        )
     with colE:
-        delete_existing = st.checkbox("Delete existing rows for each document", value=False,
-                                      help="Prevents duplicates when re-ingesting.")
+        delete_existing = st.checkbox(
+            "Delete existing rows for each document", value=False,
+            help="Prevents duplicates when re-ingesting."
+        )
     with colF:
-        batch_size = st.selectbox("Upload batch size", [64, 96, 128, 192], index=2,
-                                  help="Controls memory usage and speed for embedding+upload.")
+        batch_size = st.selectbox(
+            "Upload batch size", [64, 96, 128, 192], index=2,
+            help="Controls memory usage and speed for embedding+upload."
+        )
 
     if uploaded_files and st.button("Run ingest on selected file(s)", type="primary"):
         if auto_upload and not _supa:
@@ -481,7 +491,6 @@ with tab_ingest:
         report_rows: List[Dict[str, Any]] = []
         errors_log: List[str] = []
 
-        # Progress bar for total files
         total_files = len(uploaded_files)
         master_prog = st.progress(0.0, text=f"Processing 0/{total_files} files...")
 
@@ -492,7 +501,7 @@ with tab_ingest:
 
             try:
                 file_bytes = file.read()
-                st.session_state["last_pdf_bytes"] = file_bytes  # keep latest for QA inspector
+                st.session_state["last_pdf_bytes"] = file_bytes
                 st.session_state["last_pdf_name"] = docname
 
                 # 1) OCR + per-page metrics
@@ -525,7 +534,7 @@ with tab_ingest:
                 }
                 report_rows.append(summary)
 
-                # Optional tiny preview (inside one expander per doc)
+                # Optional tiny preview
                 if not quiet_mode and limit_preview > 0:
                     with file_zone.expander(f"Preview • {docname}  ({len(flagged)} flagged / {len(pages)} pages)"):
                         for rec in pages[:limit_preview]:
@@ -549,13 +558,13 @@ with tab_ingest:
                     texts_batch: List[str] = []
                     rows_batch: List[Dict[str, Any]] = []
 
-                    def flush_batch():
-                        nonlocal inserted, texts_batch, rows_batch
-                        if not texts_batch:
-                            return
-                        vecs = embed_texts(model, texts_batch)  # normalized embeddings
+                    # Helper: flush a batch and return how many were inserted
+                    def flush_batch_return_count(texts_list: List[str], rows_list: List[Dict[str, Any]]) -> int:
+                        if not texts_list:
+                            return 0
+                        vecs = embed_texts(model, texts_list)  # normalized embeddings
                         payload = []
-                        for r, v in zip(rows_batch, vecs):
+                        for r, v in zip(rows_list, vecs):
                             payload.append({
                                 "document_name": r["document_name"],
                                 "page_number": r["page_number"],
@@ -573,28 +582,33 @@ with tab_ingest:
                                 "embedding": v.tolist(),
                             })
                         res = _supa.table("document_chunks").insert(payload).execute()
-                        inserted += len(res.data or [])
-                        texts_batch, rows_batch = [], []
+                        return len(res.data or [])
 
                     for rec in pages:
                         texts_batch.append(rec["text"] or "")
                         rows_batch.append(rec)
                         if len(texts_batch) >= batch_size:
-                            flush_batch()
-                            file_prog.progress(min(0.90, 0.25 + 0.60 * (inserted / max(len(pages), 1))),
-                                               text=f"{docname}: uploading… {inserted}/{len(pages)}")
+                            inserted += flush_batch_return_count(texts_batch, rows_batch)
+                            texts_batch, rows_batch = [], []
+                            # progress up to 0.90 while uploading
+                            frac = 0.25 + 0.60 * (inserted / max(len(pages), 1))
+                            file_prog.progress(min(0.90, frac), text=f"{docname}: uploading… {inserted}/{len(pages)}")
 
-                    flush_batch()  # last partial batch
+                    # Final partial flush
+                    inserted += flush_batch_return_count(texts_batch, rows_batch)
+                    texts_batch, rows_batch = [], []
                     file_prog.progress(0.95, text=f"{docname}: uploaded {inserted} rows.")
 
                 file_prog.progress(1.0, text=f"{docname}: done.")
-                file_zone.success(f"✅ {docname} — pages: {summary['pages']} • flagged: {summary['flagged']} • pass-rate: {summary['pass_rate_%']}%")
+                file_zone.success(
+                    f"✅ {docname} — pages: {summary['pages']} • flagged: {summary['flagged']} • "
+                    f"pass-rate: {summary['pass_rate_%']}%"
+                )
 
             except Exception as e:
                 errors_log.append(f"{docname}: {e}")
                 file_zone.error(f"❌ {docname}: {e}")
 
-            # advance master progress
             master_prog.progress(idx / total_files, text=f"Processing {idx}/{total_files} files…")
 
         # Final report
