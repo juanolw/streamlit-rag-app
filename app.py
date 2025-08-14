@@ -17,6 +17,20 @@ from supabase import create_client
 from supabase.client import ClientOptions
 import supabase as _sb
 
+BUILD_ID = "fix-asc-2025-08-14"
+import inspect, os, re
+try:
+    with open(__file__, "r", encoding="utf-8") as _f:
+        _code = _f.read()
+    _asc_hits = len(re.findall(r"\basc\s*=", _code))
+except Exception:
+    _asc_hits = -1
+
+with st.sidebar:
+    st.write("Build:", BUILD_ID)
+    st.write("asc= occurrences in this running file:", _asc_hits)
+    st.write("Script path:", __file__)
+
 # ---------- Page ----------
 st.set_page_config(page_title="RAG: PDF → Embeddings → Search (OCR-first)", layout="wide")
 st.title("RAG App: PDF Upload → Embeddings → Search — English-first OCR (Handwriting), Arabic/Chinese")
