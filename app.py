@@ -176,8 +176,12 @@ with st.expander("⚙️ OCR Options (tune if extraction is wrong)", expanded=Fa
             index=0, format_func=lambda x: x[0]
         )[1]
     with col2:
-        lang = st.text_input("Language code", "eng",
-                             help="Install extra packs in packages.txt (e.g., tesseract-ocr-fra).")
+        # Default to English + Chinese Simplified; change as needed
+        lang = st.text_input(
+            "Language code",
+            "eng+chi_sim",
+            help="Examples: eng, chi_sim (Simplified), chi_tra (Traditional), eng+chi_sim"
+        )
         do_denoise = st.checkbox("Denoise (median)", True)
         do_autocontrast = st.checkbox("Auto-contrast", True)
     with col3:
@@ -186,19 +190,21 @@ with st.expander("⚙️ OCR Options (tune if extraction is wrong)", expanded=Fa
         force_ocr = st.checkbox("Force OCR on all pages", False,
                                 help="Ignore embedded text and OCR everything.")
 
-    # Optional custom vocabulary (.txt, one term per line)
-    user_words_file = st.file_uploader("Optional: custom vocabulary file (user_words.txt)", type=["txt"])
+    # Optional custom vocabulary (.txt only), tucked behind a toggle to avoid PDF mis-uploads
     user_words_path = None
-    if user_words_file is not None:
-        # Save to a temp path in the working directory
-        user_words_path = Path("user_words.txt").absolute()
-        with open(user_words_path, "wb") as f:
-            f.write(user_words_file.read())
-        st.caption(f"Custom vocabulary saved to {user_words_path}")
+    use_vocab = st.checkbox("Use custom vocabulary (.txt only)", value=False)
+    if use_vocab:
+        st.caption("Upload a plain .txt file with one term per line (e.g., Gen. Transporting)")
+        user_words_file = st.file_uploader("Upload custom vocabulary file (TXT only)", type=["txt"], key="user_words")
+        if user_words_file is not None:
+            user_words_path = Path("user_words.txt").absolute()
+            with open(user_words_path, "wb") as f:
+                f.write(user_words_file.read())
+            st.caption(f"Custom vocabulary saved to {user_words_path}")
 
 ocr_opts = {
     "zoom": float(zoom),
-    "lang": lang.strip() or "eng",
+    "lang": (lang or "eng").strip(),
     "psm": psm_choice,
     "do_denoise": do_denoise,
     "do_autocontrast": do_autocontrast,
