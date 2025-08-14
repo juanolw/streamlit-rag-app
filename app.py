@@ -1,8 +1,8 @@
-# app.py — Clean UI (bigger tabs, KPI cards, clearer QA) + your existing pipeline
+# app.py — Pro UI polish (brand header, pill tabs, KPI cards, QA chart) + your working RAG pipeline
 # Pipeline: PDF → OCR (auto-QA) → normalize → embed → Supabase → search
 # Notes:
-# - No 'asc=' anywhere (works with supabase-py >= 2.5).
-# - Adds CSS for modern look, QA KPI cards, how-to, and a small chart.
+# - UI only: your OCR/QA/search logic stays the same.
+# - No 'asc=' anywhere (ok with supabase-py >= 2.5).
 
 import io
 import re
@@ -22,6 +22,7 @@ from PIL import Image, ImageOps, ImageFilter
 from sentence_transformers import SentenceTransformer
 from supabase import create_client, ClientOptions
 import supabase as _sb
+import altair as alt
 
 # Optional: fuzzy fallback
 try:
@@ -29,18 +30,51 @@ try:
 except Exception:
     partial_ratio = None
 
-BUILD_ID = "ui-polish-tabs-kpis-qahelp-2025-08-14"
-st.set_page_config(page_title="RAG (Ingest | Search | QA)", layout="wide")
+BUILD_ID = "pro-ui-polish-2025-08-14"
+st.set_page_config(
+    page_title="RAG (Ingest | Search | QA)",
+    page_icon="📚",
+    layout="wide",
+    menu_items={"Get Help": None, "About": "RAG for Construction Claims — OCR, Search & QA"}
+)
 
-# ---------------- Global CSS (tabs, cards, badges) ----------------
+# ---------------- Global CSS (fonts, header, tabs, cards, controls) ----------------
 st.markdown(
     """
 <style>
+/* Google Font */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+html, body, [class*="css"] { font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+
+/* Main container width & spacing */
+.main .block-container { padding-top: 1rem; padding-bottom: 2rem; }
+
+/* Brand header */
+.brandbar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 16px 20px; margin-bottom: 0.5rem;
+  background: linear-gradient(135deg, rgba(37,99,235,0.08), rgba(124,58,237,0.08));
+  border: 1px solid rgba(49,51,63,0.10); border-radius: 16px;
+}
+.brandbar__left { display:flex; align-items:center; gap:12px; }
+.brandbar__logo {
+  width: 36px; height: 36px; border-radius: 10px;
+  background: linear-gradient(135deg, #2563eb, #7c3aed);
+  display:flex; align-items:center; justify-content:center; color:white; font-weight:700;
+}
+.brandbar__title { font-size: 1.15rem; font-weight: 700; margin:0; }
+.brandbar__subtitle { font-size: 0.9rem; opacity: 0.8; margin:0; }
+.brandbar__right { display:flex; gap:8px; }
+.brandbar__chip {
+  padding: 6px 10px; border-radius: 999px; font-size: 0.8rem; font-weight: 600;
+  background: var(--secondary-background-color); border: 1px solid rgba(49,51,63,0.12);
+}
+
 /* Bigger, pill-style tabs */
 .stTabs [role="tab"] {
   background-color: var(--secondary-background-color);
-  padding: 10px 18px;
-  margin-right: 8px;
+  padding: 12px 18px;
+  margin-right: 10px;
   border-radius: 999px;
   font-weight: 600;
   font-size: 1rem;
@@ -50,6 +84,7 @@ st.markdown(
   background: linear-gradient(135deg, #2563eb, #7c3aed);
   color: white;
   border-color: transparent;
+  box-shadow: 0 2px 10px rgba(37,99,235,0.25);
 }
 .stTabs [role="tab"]:hover {
   border-color: rgba(49,51,63,0.35);
@@ -57,8 +92,7 @@ st.markdown(
 
 /* KPI cards */
 .kpi-card { 
-  border-radius: 16px; 
-  padding: 14px 16px; 
+  border-radius: 16px; padding: 14px 16px; 
   background: var(--secondary-background-color); 
   border: 1px solid rgba(49,51,63,0.15);
 }
@@ -70,7 +104,46 @@ st.markdown(
 .badge--ok   { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; }
 .badge--warn { background:#fff7ed; color:#9a3412; border:1px solid #fed7aa; }
 .badge--err  { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; }
+
+/* Softer inputs & buttons */
+.stButton > button { 
+  border-radius: 12px; font-weight: 700; padding: 0.5rem 0.9rem;
+  border: 1px solid rgba(49,51,63,0.18);
+}
+.stDownloadButton > button { border-radius: 12px; }
+.stTextInput > div > div > input,
+.stNumberInput input, .stSelectbox div[data-baseweb="select"] > div,
+.stFileUploader {
+  border-radius: 12px !important;
+  border: 1px solid rgba(49,51,63,0.18);
+}
+
+/* Code/textarea */
+.stTextArea textarea { border-radius: 12px; }
+
+/* Dataframe corners */
+[data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
 </style>
+""",
+    unsafe_allow_html=True,
+)
+
+# ---------------- Brand header ----------------
+st.markdown(
+    f"""
+<div class="brandbar">
+  <div class="brandbar__left">
+    <div class="brandbar__logo">R</div>
+    <div>
+      <p class="brandbar__title">RAG for Construction Claims</p>
+      <p class="brandbar__subtitle">OCR • Search • QA dashboard</p>
+    </div>
+  </div>
+  <div class="brandbar__right">
+    <div class="brandbar__chip">Build {BUILD_ID}</div>
+    <div class="brandbar__chip">supabase-py {_sb.__version__}</div>
+  </div>
+</div>
 """,
     unsafe_allow_html=True,
 )
@@ -78,8 +151,6 @@ st.markdown(
 # ---------------- Sidebar: environment & OCR options ----------------
 with st.sidebar:
     st.header("Setup & OCR Options")
-    st.caption(f"Build: {BUILD_ID}")
-    st.caption(f"supabase-py: {_sb.__version__}")
     try:
         langs = pytesseract.get_languages(config="")
         st.caption("Tesseract languages: " + ", ".join(sorted(langs)))
@@ -274,7 +345,7 @@ def ocr_page_auto(page, preset: str, user_words_path: Optional[str], base_zoom: 
         if engine == "trocr":
             try:
                 text = trocr_ocr(page, zoom=cfg["zoom"])
-                avg_conf = 65.0  # proxy for non-tesseract engine
+                avg_conf = 65.0
                 text_norm = normalize_text(text)
                 flags = make_flags(avg_conf, text_norm, preset)
                 cand = dict(text=text, text_norm=text_norm, avg_conf=avg_conf,
@@ -425,8 +496,6 @@ def local_semantic_search(rows: List[Dict[str, Any]], query_vec: np.ndarray, top
     return kept
 
 # ========================= UI: Tabs =========================
-st.title("RAG App — Ingest | Search | QA")
-
 tab_ingest, tab_search, tab_qa = st.tabs(["📥 Ingest", "🔎 Search", "✅ QA"])
 
 # ---------------- Tab: Ingest ----------------
@@ -681,13 +750,13 @@ with tab_qa:
     if not _supa:
         st.info("Configure Supabase first.")
     else:
-        # Top How-To (kept concise)
+        # How-To (concise)
         st.info(
             "How to use QA:\n"
-            "1) Pick a document (or 'All') and a minimum confidence.\n"
-            "2) Click **List flagged pages** to see what needs attention.\n"
-            "3) Export CSV for triage, or run **Re-OCR flagged pages** for the **last uploaded PDF**.\n"
-            "4) Use **Single-page Inspector** for a precise fix."
+            "1) Choose a document (or **All**) and set **Min conf**.\n"
+            "2) Click **List flagged pages** → export CSV if needed.\n"
+            "3) Use **Batch re-OCR** to fix the **last uploaded PDF**.\n"
+            "4) For a single page, use **Inspector** to test variants and update."
         )
 
         # KPI row
@@ -724,9 +793,14 @@ with tab_qa:
         st.markdown("---")
 
         # Controls for listing flagged
+        try:
+            _docs = _supa.table("document_chunks").select("document_name").execute()
+            qa_docs = sorted({r["document_name"] for r in (_docs.data or []) if r.get("document_name")})
+        except Exception:
+            qa_docs = []
         colq1, colq2, colq3 = st.columns([2,1,1])
         with colq1:
-            sel_doc = st.selectbox("Filter by doc (optional)", ["All"] + all_docs, key="qa_doc")
+            sel_doc = st.selectbox("Filter by doc (optional)", ["All"] + qa_docs, key="qa_doc")
         with colq2:
             min_conf = st.slider("Min conf", 0, 100, 65, key="qa_conf")
         with colq3:
@@ -751,11 +825,27 @@ with tab_qa:
                     csv = df.to_csv(index=False).encode("utf-8")
                     st.download_button("Download CSV", data=csv, file_name="ocr_flagged_pages.csv", mime="text/csv")
 
-                    # Small chart: top flagged docs
+                    # Modern Altair chart: top flagged documents
                     try:
-                        top_counts = df["document_name"].value_counts().head(15)
+                        chart_df = (
+                            df.groupby("document_name", as_index=False)
+                              .size()
+                              .rename(columns={"size": "flagged"})
+                              .sort_values("flagged", ascending=False)
+                              .head(15)
+                        )
+                        chart = (
+                            alt.Chart(chart_df)
+                               .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
+                               .encode(
+                                    x=alt.X("flagged:Q", title="Flagged pages"),
+                                    y=alt.Y("document_name:N", sort='-x', title="Document"),
+                                    tooltip=["document_name:N","flagged:Q"]
+                                )
+                               .properties(height=380)
+                        )
                         st.markdown("**Top flagged documents**")
-                        st.bar_chart(top_counts)
+                        st.altair_chart(chart, use_container_width=True)
                     except Exception:
                         pass
             except Exception as e:
