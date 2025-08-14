@@ -2,3 +2,6 @@ streamlit
 pymupdf
 pytesseract
 Pillow
+supabase
+sentence-transformers
+numpy
