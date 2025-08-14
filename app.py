@@ -1,5 +1,5 @@
-# app.py — RAG: PDF → OCR → normalize → embed → Supabase → search
-# Modes: Keyword (exact/normalized), Keyword (fuzzy w/ pg_trgm or local fallback), Semantic (RPC or local)
+# app.py — RAG: PDF → OCR → QA → normalize → embed → Supabase → search
+# Adds automated OCR Quality Control + QA Dashboard
 
 import io
 import re
@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 
 import numpy as np
+import pandas as pd
 import streamlit as st
 import fitz  # PyMuPDF
 import pytesseract
@@ -23,26 +24,17 @@ import supabase as _sb
 try:
     from rapidfuzz.fuzz import partial_ratio
 except Exception:
-    partial_ratio = None  # We'll handle gracefully if not installed
+    partial_ratio = None  # handled gracefully if not installed
 
-# ===================== DEBUG: Build tag + asc scanner =====================
-BUILD_ID = "full-python-stack-ocr-fuzzy-2025-08-14"
-try:
-    with open(__file__, "r", encoding="utf-8") as _f:
-        _src = _f.read()
-    ASC_OCCURRENCES = len(re.findall(r"\border\s*\([^)]*asc\s*=", _src))
-except Exception:
-    ASC_OCCURRENCES = -1
-# ==========================================================================
+# ===================== DEBUG / BUILD =====================
+BUILD_ID = "qa-autoretry-2025-08-14"
+st.set_page_config(page_title="RAG (OCR QA + Supabase)", layout="wide")
+st.title("RAG App — OCR QA → Embeddings → Supabase Search")
 
-st.set_page_config(page_title="RAG (OCR + Supabase)", layout="wide")
-st.title("RAG App — PDF → OCR → Embeddings → Supabase Search")
-
-# ---------------- Sidebar: environment checks ----------------
+# ===================== SUPABASE ==========================
 with st.sidebar:
     st.header("Setup checks")
     st.write("Build:", BUILD_ID)
-    st.write("`asc=` occurrences in this running file:", ASC_OCCURRENCES)
     st.write("supabase-py version:", _sb.__version__)
     if "SUPABASE_URL" in st.secrets:
         st.caption("SUPABASE_URL: " + st.secrets["SUPABASE_URL"])
@@ -72,41 +64,28 @@ if _supa:
     except Exception as e:
         st.sidebar.error(f"❌ Supabase connection failed: {e}")
 
-# ---------------- Normalization helpers ----------------
-ZW_REMOVE = dict.fromkeys(map(ord, "\u00ad\u200b\u200c\u200d\ufeff"), None)  # soft hyphen + zero-widths
-PUNCT_MAP = str.maketrans({
-    "’": "'", "‘": "'", "“": '"', "”": '"',
-    "–": "-", "—": "-", "\u00A0": " ", "·": " "
-})
+# ===================== NORMALIZATION =====================
+ZW_REMOVE = dict.fromkeys(map(ord, "\u00ad\u200b\u200c\u200d\ufeff"), None)  # soft hyphen/ZW
+PUNCT_MAP = str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"', "–": "-", "—": "-", "\u00A0": " ", "·": " "})
 _PUNCT_STRIP_RE = re.compile(r"[.,:;|/\\()\[\]{}<>•·…]+")
 _SPACE_COLLAPSE_RE = re.compile(r"\s+")
 
 def normalize_text(s: str) -> str:
-    """
-    Aggressive normalization for keyword matching:
-    - join hyphenated line breaks, flatten newlines
-    - remove zero-width & soft hyphen
-    - normalize quotes/dashes; strip most punctuation to spaces
-    - NFKC unicode normalize; collapse spaces; lowercase
-    """
     if not s:
         return ""
-    s = s.replace("-\n", "")          # de-hyphenate end-of-line
-    s = s.replace("\n", " ")          # flatten newlines
+    s = s.replace("-\n", "").replace("\n", " ")
     s = s.translate(ZW_REMOVE).translate(PUNCT_MAP)
     s = unicodedata.normalize("NFKC", s)
-    s = _PUNCT_STRIP_RE.sub(" ", s)   # turn .,;:/()[]{}<>… into spaces
+    s = _PUNCT_STRIP_RE.sub(" ", s)
     s = _SPACE_COLLAPSE_RE.sub(" ", s).strip()
     return s.lower()
 
 def escape_for_or_filter(s: str) -> str:
-    # PostgREST .or_ uses comma as separator; escape commas in query
     return s.replace(",", r"\,")
 
-# ---------------- Caches ----------------
+# ===================== CACHES ============================
 @st.cache_resource(show_spinner=True)
 def load_embedding_model():
-    # 384-dim, light & solid for retrieval
     return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 @st.cache_resource(show_spinner=True)
@@ -120,20 +99,13 @@ def load_trocr_handwritten():
     model.to(device)
     return processor, model, device
 
-# ---------------- Page render & preprocessing ----------------
+# ===================== OCR & QA ==========================
 def render_page_to_image(page, zoom: float = 3.0) -> Image.Image:
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
     return Image.open(io.BytesIO(pix.tobytes("png")))
 
-def preprocess_image(
-    img: Image.Image,
-    do_denoise: bool = True,
-    do_autocontrast: bool = True,
-    binarize: bool = True,
-    thresh: int = 180,
-    to_gray: bool = True,
-) -> Image.Image:
+def preprocess_image(img: Image.Image, do_denoise=True, do_autocontrast=True, binarize=True, thresh=180, to_gray=True):
     if to_gray:
         img = img.convert("L")
     if do_denoise:
@@ -144,53 +116,30 @@ def preprocess_image(
         img = img.point(lambda p: 255 if p > thresh else 0)
     return img
 
-# ---------------- OCR engines ----------------
-def tesseract_ocr(
-    page,
-    zoom: float,
-    lang: str,
-    psm: str,
-    do_denoise: bool,
-    do_autocontrast: bool,
-    binarize: bool,
-    thresh: int,
-    user_words_path: Optional[str] = None,
-    timeout_sec: int = 20,
-) -> Tuple[str, float]:
-    """
-    Tesseract OCR with confidence and a hard timeout.
-    Returns (text, avg_conf). On timeout/failure, returns best-effort text with low conf.
-    """
+def tesseract_ocr(page, zoom: float, lang: str, psm: str, user_words_path: Optional[str], timeout_sec: int = 20) -> Tuple[str, float]:
     img = render_page_to_image(page, zoom=zoom)
-    img = preprocess_image(img, do_denoise, do_autocontrast, binarize, thresh, to_gray=True)
-
+    img = preprocess_image(img, True, True, True, 175, to_gray=True)
     config = f"--oem 1 --psm {psm} -c preserve_interword_spaces=1"
     if user_words_path:
         config += f" --user-words {user_words_path}"
-
     try:
-        data = pytesseract.image_to_data(
-            img, lang=lang, config=config, output_type=TessOutput.DICT, timeout=timeout_sec
-        )
+        data = pytesseract.image_to_data(img, lang=lang, config=config, output_type=TessOutput.DICT, timeout=timeout_sec)
         words = [w for w in data.get("text", []) if isinstance(w, str) and w.strip()]
         confs = [int(c) for c in data.get("conf", []) if c not in (None, "", "-1")]
         avg_conf = float(sum(confs) / len(confs)) if confs else 0.0
         text = " ".join(words) if words else ""
     except Exception:
-        # Fallback to plain string with shorter timeout
         try:
             text = pytesseract.image_to_string(img, lang=lang, config=config, timeout=max(5, timeout_sec // 2))
         except Exception:
             text = ""
         return (text or "").strip(), 0.0
-
     if not text.strip():
         try:
             text2 = pytesseract.image_to_string(img, lang=lang, config=config, timeout=timeout_sec)
             text = text2 or text
         except Exception:
             pass
-
     return (text or "").strip(), avg_conf
 
 def trocr_ocr(page, zoom: float) -> str:
@@ -203,84 +152,110 @@ def trocr_ocr(page, zoom: float) -> str:
         text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
     return (text or "").strip()
 
-# ---------------- OCR strategy ----------------
-def ocr_strategy(
-    page,
-    preset: str,
-    user_words_path: Optional[str],
-    force_ocr: bool,
-    base_zoom: float,
-    use_trocr: bool,
-    timeout_sec: int,
-    psm_eng: str = "6",
-    psm_rtl_cjk: str = "4",
-    intensive: bool = False,
-) -> str:
+# QA thresholds by preset
+THRESH = {
+    "English (printed)":        {"min_conf": 70, "min_len": 15, "max_noisy": 0.60},
+    "English (handwritten)":    {"min_conf": 60, "min_len": 10, "max_noisy": 0.70},
+    "Arabic (ara)":             {"min_conf": 60, "min_len": 10, "max_noisy": 0.70},
+    "Chinese (Simplified)":     {"min_conf": 60, "min_len": 10, "max_noisy": 0.70},
+    "Chinese (Traditional)":    {"min_conf": 60, "min_len": 10, "max_noisy": 0.70},
+}
+
+def qc_metrics(text_norm: str) -> Dict[str, Any]:
+    n = len(text_norm)
+    alnum = sum(ch.isalnum() for ch in text_norm)
+    non_alnum_ratio = 1.0 - (alnum / n) if n else 1.0
+    return {"text_len": n, "non_alnum_ratio": non_alnum_ratio}
+
+def make_flags(avg_conf: float, text_norm: str, preset: str) -> List[str]:
+    t = THRESH.get(preset, THRESH["English (printed)"])
+    m = qc_metrics(text_norm)
+    flags = []
+    if avg_conf < t["min_conf"]:
+        flags.append("low_conf")
+    if m["text_len"] < t["min_len"]:
+        flags.append("very_short")
+    if m["non_alnum_ratio"] > t["max_noisy"]:
+        flags.append("noisy_text")
+    if not text_norm:
+        flags.append("empty")
+    return flags
+
+def ocr_variants_for_preset(preset: str, use_trocr: bool, base_zoom: float):
     if preset == "English (printed)":
-        text, conf = tesseract_ocr(page, base_zoom, "eng", psm_eng, True, True, True, 180, user_words_path, timeout_sec)
-        if conf < 70 and intensive:
-            text2, conf2 = tesseract_ocr(page, base_zoom + 0.5, "eng", "4", True, True, True, 180, user_words_path, timeout_sec)
-            return text2 if conf2 > conf else text
-        return text
-
+        return [("tess-eng", {"lang": "eng", "psm": "6",  "zoom": base_zoom}),
+                ("tess-eng", {"lang": "eng", "psm": "4",  "zoom": base_zoom + 0.5}),
+                ("tess-eng", {"lang": "eng", "psm": "11", "zoom": base_zoom + 0.5})]
     if preset == "English (handwritten)":
+        v = []
         if use_trocr:
-            try:
-                text = trocr_ocr(page, max(3.0, base_zoom))
-                if len(text) >= 4:
-                    return text
-            except Exception:
-                pass
-        text, conf = tesseract_ocr(page, base_zoom + 0.5, "eng", "4", True, True, True, 175, user_words_path, timeout_sec)
-        if conf < 65 and intensive:
-            text2, conf2 = tesseract_ocr(page, base_zoom + 1.0, "eng", "3", True, True, True, 170, user_words_path, timeout_sec)
-            return text2 if conf2 > conf else text
-        return text
-
+            v.append(("trocr", {"zoom": max(3.0, base_zoom)}))
+        v += [("tess-eng", {"lang": "eng", "psm": "4",  "zoom": base_zoom + 0.5}),
+              ("tess-eng", {"lang": "eng", "psm": "3",  "zoom": base_zoom + 1.0})]
+        return v
     if preset == "Arabic (ara)":
-        text, conf = tesseract_ocr(page, base_zoom, "ara", psm_rtl_cjk, True, True, True, 180, user_words_path, timeout_sec)
-        if conf < 65 and intensive:
-            text2, conf2 = tesseract_ocr(page, base_zoom + 0.5, "ara", "3", True, True, True, 175, user_words_path, timeout_sec)
-            return text2 if conf2 > conf else text
-        return text
-
+        return [("tess", {"lang": "ara", "psm": "4", "zoom": base_zoom}),
+                ("tess", {"lang": "ara", "psm": "3", "zoom": base_zoom + 0.5})]
     if preset == "Chinese (Simplified)":
-        text, conf = tesseract_ocr(page, base_zoom, "chi_sim", psm_rtl_cjk, True, True, True, 180, user_words_path, timeout_sec)
-        if conf < 65 and intensive:
-            text2, conf2 = tesseract_ocr(page, base_zoom + 0.5, "chi_sim", "3", True, True, True, 175, user_words_path, timeout_sec)
-            return text2 if conf2 > conf else text
-        return text
-
+        return [("tess", {"lang": "chi_sim", "psm": "4", "zoom": base_zoom}),
+                ("tess", {"lang": "chi_sim", "psm": "3", "zoom": base_zoom + 0.5})]
     if preset == "Chinese (Traditional)":
-        text, conf = tesseract_ocr(page, base_zoom, "chi_tra", psm_rtl_cjk, True, True, True, 180, user_words_path, timeout_sec)
-        if conf < 65 and intensive:
-            text2, conf2 = tesseract_ocr(page, base_zoom + 0.5, "chi_tra", "3", True, True, True, 175, user_words_path, timeout_sec)
-            return text2 if conf2 > conf else text
-        return text
+        return [("tess", {"lang": "chi_tra", "psm": "4", "zoom": base_zoom}),
+                ("tess", {"lang": "chi_tra", "psm": "3", "zoom": base_zoom + 0.5})]
+    return [("tess-eng", {"lang": "eng", "psm": "6", "zoom": base_zoom})]
 
-    text, _ = tesseract_ocr(page, base_zoom, "eng", "6", True, True, True, 180, user_words_path, timeout_sec)
-    return text
+def ocr_page_auto(page, preset: str, user_words_path: Optional[str], base_zoom: float, timeout_sec: int, use_trocr: bool, max_attempts: int = 3):
+    variants = ocr_variants_for_preset(preset, use_trocr, base_zoom)[:max_attempts]
+    best = None
+    for idx, (engine, cfg) in enumerate(variants, 1):
+        if engine == "trocr":
+            try:
+                text = trocr_ocr(page, zoom=cfg["zoom"])
+                avg_conf = 65.0  # treat as mid-confidence proxy
+                text_norm = normalize_text(text)
+                flags = make_flags(avg_conf, text_norm, preset)
+                cand = dict(text=text, text_norm=text_norm, avg_conf=avg_conf,
+                            ocr_engine="trocr", ocr_psm=None, ocr_zoom=float(cfg["zoom"]),
+                            ocr_attempts=idx, flags=flags)
+            except Exception:
+                continue
+        else:
+            text, avg_conf = tesseract_ocr(page, zoom=float(cfg["zoom"]),
+                                           lang=cfg.get("lang", "eng"), psm=cfg.get("psm", "6"),
+                                           user_words_path=user_words_path, timeout_sec=timeout_sec)
+            text_norm = normalize_text(text)
+            flags = make_flags(avg_conf, text_norm, preset)
+            cand = dict(text=text, text_norm=text_norm, avg_conf=avg_conf,
+                        ocr_engine="tesseract", ocr_psm=int(cfg.get("psm", "6")), ocr_zoom=float(cfg["zoom"]),
+                        ocr_attempts=idx, flags=flags)
+        # prefer first candidate that passes all checks
+        if not cand["flags"]:
+            return cand
+        # track best by composite score: conf + length bonus
+        score = cand["avg_conf"] + min(len(cand["text_norm"]), 200) * 0.2
+        if not best or score > best.get("_score", -1):
+            cand["_score"] = score
+            best = cand
+    return best or dict(text="", text_norm="", avg_conf=0.0, ocr_engine="tesseract", ocr_psm=6, ocr_zoom=base_zoom, ocr_attempts=len(variants), flags=["empty"])
 
-# ---------------- Extractors ----------------
+# ===================== EXTRACTORS ========================
 def extract_text_from_pdf(file_bytes, preset: str, user_words_path: Optional[str],
-                          force_ocr: bool, intensive: bool, base_zoom: float,
-                          use_trocr: bool, timeout_sec: int, max_pages: int = 0):
+                          base_zoom: float, use_trocr: bool, timeout_sec: int, max_pages: int = 0):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
-    parts = []
-    total = len(doc)
+    parts, total = [], len(doc)
     limit = min(total, max_pages) if max_pages and max_pages > 0 else total
     prog = st.progress(0, text=f"Extracting text 0/{limit} pages...")
     for i, page in enumerate(doc):
         if i >= limit:
             break
         try:
-            text = ""
-            if not force_ocr:
-                text = (page.get_text() or "").strip()
-            if not text:
-                text = ocr_strategy(page, preset, user_words_path, force_ocr, base_zoom,
-                                    use_trocr=use_trocr, timeout_sec=timeout_sec, intensive=intensive)
-            parts.append(text)
+            # attempt embedded text first
+            embedded = (page.get_text() or "").strip()
+            if embedded:
+                parts.append(embedded)
+            else:
+                cand = ocr_page_auto(page, preset, user_words_path, base_zoom, timeout_sec, use_trocr)
+                parts.append(cand["text"])
         except Exception as e:
             parts.append(f"[Error reading page {i+1}: {e}]")
         finally:
@@ -289,63 +264,87 @@ def extract_text_from_pdf(file_bytes, preset: str, user_words_path: Optional[str
     return "\n\n--- PAGE BREAK ---\n\n".join(parts).strip()
 
 def extract_pages_with_metadata(file_bytes, document_name, preset: str, user_words_path: Optional[str],
-                                force_ocr: bool, intensive: bool, base_zoom: float,
-                                use_trocr: bool, timeout_sec: int, max_pages: int = 0):
+                                base_zoom: float, use_trocr: bool, timeout_sec: int, max_pages: int = 0):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     total = len(doc)
     limit = min(total, max_pages) if max_pages and max_pages > 0 else total
-    pages = []
-    prog = st.progress(0, text=f"Splitting into page chunks 0/{limit}...")
+    rows = []
+    prog = st.progress(0, text=f"Splitting & OCR 0/{limit}...")
     for i, page in enumerate(doc):
         if i >= limit:
             break
         try:
-            text = ""
-            if not force_ocr:
-                text = (page.get_text() or "").strip()
-            if not text:
-                text = ocr_strategy(page, preset, user_words_path, force_ocr, base_zoom,
-                                    use_trocr=use_trocr, timeout_sec=timeout_sec, intensive=intensive)
-            pages.append({"document_name": document_name, "page_number": i + 1, "text": text})
+            embedded = (page.get_text() or "").strip()
+            if embedded:
+                text = embedded
+                text_norm = normalize_text(text)
+                avg_conf = 80.0
+                flags = make_flags(avg_conf, text_norm, preset)  # usually passes
+                meta = dict(ocr_engine="embedded", ocr_psm=None, ocr_zoom=None, ocr_attempts=1)
+            else:
+                cand = ocr_page_auto(page, preset, user_words_path, base_zoom, timeout_sec, use_trocr)
+                text, text_norm, avg_conf, flags = cand["text"], cand["text_norm"], cand["avg_conf"], cand["flags"]
+                meta = dict(ocr_engine=cand["ocr_engine"], ocr_psm=cand["ocr_psm"], ocr_zoom=cand["ocr_zoom"], ocr_attempts=cand["ocr_attempts"])
+            m = qc_metrics(text_norm)
+            rows.append({
+                "document_name": document_name,
+                "page_number": i + 1,
+                "text": text,
+                "text_norm": text_norm,
+                "avg_conf": float(avg_conf),
+                "text_len": int(m["text_len"]),
+                "non_alnum_ratio": float(m["non_alnum_ratio"]),
+                "ocr_engine": meta["ocr_engine"],
+                "ocr_psm": meta["ocr_psm"],
+                "ocr_zoom": meta["ocr_zoom"],
+                "ocr_attempts": meta["ocr_attempts"],
+                "ocr_flags": flags,
+                "lang_preset": preset,
+            })
         except Exception as e:
-            pages.append({"document_name": document_name, "page_number": i + 1, "text": f"[Error: {e}]"})
+            rows.append({
+                "document_name": document_name,
+                "page_number": i + 1,
+                "text": f"[Error: {e}]",
+                "text_norm": "",
+                "avg_conf": 0.0,
+                "text_len": 0,
+                "non_alnum_ratio": 1.0,
+                "ocr_engine": "error",
+                "ocr_psm": None,
+                "ocr_zoom": None,
+                "ocr_attempts": 1,
+                "ocr_flags": ["error"],
+                "lang_preset": preset,
+            })
         finally:
-            prog.progress((i + 1) / limit, text=f"Splitting into page chunks {i+1}/{limit}...")
+            prog.progress((i + 1) / limit, text=f"Splitting & OCR {i+1}/{limit}...")
     doc.close()
-    return pages
+    return rows
 
-# ---------------- Embeddings ----------------
+# ===================== EMBEDDINGS ========================
 def embed_texts(model, texts):
     emb = model.encode(texts, batch_size=32, show_progress_bar=True)
     emb = np.asarray(emb, dtype=np.float32)
     emb /= (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
     return emb
 
-# ---------------- OCR options UI ----------------
+# ===================== OCR OPTIONS UI ====================
 with st.expander("⚙️ OCR Language & Options", expanded=True):
     preset = st.selectbox(
         "Language preset",
         ["English (printed)", "English (handwritten)", "Arabic (ara)", "Chinese (Simplified)", "Chinese (Traditional)"],
         index=0
     )
-    if preset == "English (printed)":
-        default_zoom = 3.0; default_intensive = False
-    elif preset == "English (handwritten)":
-        default_zoom = 3.5; default_intensive = True
-    else:
-        default_zoom = 3.5; default_intensive = True
-
+    default_zoom = 3.0 if preset == "English (printed)" else 3.5
     col1, col2 = st.columns(2)
     with col1:
         base_zoom = st.slider("Render zoom (DPI proxy)", 2.0, 4.5, default_zoom, 0.5)
-        force_ocr = st.checkbox("Force OCR on all pages (ignore embedded text)", False)
         max_pages_debug = st.number_input("Limit pages to process (0 = all)", min_value=0, value=0, step=1)
     with col2:
-        intensive = st.checkbox("Intensive mode (retry with higher DPI if low confidence)", default_intensive)
         timeout_sec = st.slider("OCR timeout per page (sec)", 5, 60, 20)
         use_trocr = st.checkbox("Use handwriting engine (TrOCR) when preset = English (handwritten)", value=False)
 
-    # Optional vocabulary file (.txt)
     user_words_path = None
     use_vocab = st.checkbox("Use custom vocabulary (.txt only)", value=False)
     if use_vocab:
@@ -357,7 +356,7 @@ with st.expander("⚙️ OCR Language & Options", expanded=True):
                 f.write(user_words_file.read())
             st.caption(f"Custom vocabulary saved to {user_words_path}")
 
-# ---------------- STEP 1: Upload & Extract ----------------
+# ===================== STEP 1: Upload & Extract ==========
 st.header("Step 1: Upload & Extract")
 uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", key="pdf_uploader")
 
@@ -371,11 +370,11 @@ if uploaded_file:
                 st.session_state["last_pdf_name"] = uploaded_file.name
 
                 full_text = extract_text_from_pdf(
-                    file_bytes, preset, user_words_path, force_ocr, intensive, base_zoom,
+                    file_bytes, preset, user_words_path, base_zoom,
                     use_trocr=use_trocr, timeout_sec=timeout_sec, max_pages=max_pages_debug
                 )
                 page_chunks = extract_pages_with_metadata(
-                    file_bytes, uploaded_file.name, preset, user_words_path, force_ocr, intensive, base_zoom,
+                    file_bytes, uploaded_file.name, preset, user_words_path, base_zoom,
                     use_trocr=use_trocr, timeout_sec=timeout_sec, max_pages=max_pages_debug
                 )
                 st.session_state["pages"] = page_chunks
@@ -387,6 +386,7 @@ if uploaded_file:
                     st.markdown(f"**{rec['document_name']} — Page {rec['page_number']}**")
                     preview = (rec["text"] or "").replace("\n", " ")
                     st.write((preview[:500] + ("..." if len(preview) > 500 else "")) or "_(empty page)_")
+                    st.caption(f"flags={rec['ocr_flags']}, conf={rec['avg_conf']:.1f}, len={rec['text_len']}, noisy={rec['non_alnum_ratio']:.2f}")
                     st.divider()
 
                 st.subheader("Full Extracted Text")
@@ -395,7 +395,7 @@ if uploaded_file:
                 st.error("PDF processing failed.")
                 st.exception(e)
 
-# ---------------- STEP 2: Embed & Upload to Supabase ----------------
+# ===================== STEP 2: Embed & Upload ============
 st.header("Step 2: Embed & Upload to Supabase")
 
 if not _supa:
@@ -403,36 +403,10 @@ if not _supa:
 elif "pages" not in st.session_state or not st.session_state["pages"]:
     st.info("No pages detected yet. Complete Step 1 first, then return here.")
 else:
-    st.write(
-        f"Pages ready to index: **{len(st.session_state['pages'])}** "
-        f"(from **{st.session_state.get('document_name','unknown')}**)"
-    )
-    colA, colB = st.columns(2)
-    with colA:
-        delete_first = st.checkbox("Delete existing rows for this document before upload", False)
-    with colB:
-        st.caption("Check to avoid duplicates if re-indexing the same PDF.")
-
+    st.write(f"Pages ready to index: **{len(st.session_state['pages'])}** (from **{st.session_state.get('document_name','unknown')}**)")
+    delete_first = st.checkbox("Delete existing rows for this document before upload", False)
     if st.button("2) Generate embeddings & upload", type="primary"):
         try:
-            # ensure text_norm column exists (silent if not)
-            try:
-                _ = _supa.table("document_chunks").select("text_norm").limit(1).execute()
-            except Exception:
-                st.warning("Column text_norm not found. Create it in Supabase: ALTER TABLE document_chunks ADD COLUMN text_norm text;")
-
-            if delete_first:
-                try:
-                    _ = _supa.rpc(
-                        "delete_document", {"p_document_name": st.session_state.get("document_name", "")}
-                    ).execute()
-                    st.info("Old rows for this document deleted (if any).")
-                except Exception:
-                    _supa.table("document_chunks").delete().eq(
-                        "document_name", st.session_state.get("document_name", "")
-                    ).execute()
-                    st.info("Old rows deleted via fallback.")
-
             model = load_embedding_model()
             pages = st.session_state["pages"]
             texts = [p["text"] if p["text"] else "" for p in pages]
@@ -442,16 +416,31 @@ else:
 
             rows = []
             for p, vec in zip(pages, emb):
-                raw = p["text"] or ""
                 rows.append(
                     {
                         "document_name": p["document_name"],
                         "page_number": p["page_number"],
-                        "text": raw,
-                        "text_norm": normalize_text(raw),
+                        "text": p["text"],
+                        "text_norm": p["text_norm"],
+                        "avg_conf": p["avg_conf"],
+                        "text_len": p["text_len"],
+                        "non_alnum_ratio": p["non_alnum_ratio"],
+                        "ocr_engine": p["ocr_engine"],
+                        "ocr_psm": p["ocr_psm"],
+                        "ocr_zoom": p["ocr_zoom"],
+                        "ocr_attempts": p["ocr_attempts"],
+                        "ocr_flags": p["ocr_flags"],
+                        "lang_preset": p["lang_preset"],
                         "embedding": vec.tolist(),
                     }
                 )
+
+            if delete_first:
+                try:
+                    _ = _supa.table("document_chunks").delete().eq("document_name", st.session_state.get("document_name", "")).execute()
+                    st.info("Old rows deleted.")
+                except Exception as e:
+                    st.warning(f"Couldn't delete old rows: {e}")
 
             st.info("Uploading to Supabase…")
             BATCH = 100
@@ -460,78 +449,31 @@ else:
                 batch = rows[i : i + BATCH]
                 res = _supa.table("document_chunks").insert(batch).execute()
                 if getattr(res, "data", None) is None:
-                    st.error(
-                        f"No data returned for batch {i+1}-{i+len(batch)}. "
-                        f"Check RLS (disable or add anon INSERT/SELECT policies) and that the table exists."
-                    )
+                    st.error("Insert returned no data. Check RLS and table schema.")
                     st.write(res)
                     st.stop()
                 inserted += len(res.data)
                 st.write(f"Inserted rows {i+1}–{i+len(batch)} (total {inserted})")
                 time.sleep(0.05)
 
-            st.success(f"All chunks uploaded to Supabase. Total inserted: {inserted}")
-            st.info(
-                "If you don't see data in Table Editor, ensure RLS is disabled or anon policies allow INSERT/SELECT."
-            )
+            st.success(f"All chunks uploaded. Total inserted: {inserted}")
         except Exception as e:
             st.error("Embedding or upload failed.")
             st.exception(e)
 
-    # ---- Maintenance: Backfill text_norm for existing rows in this doc ----
-    with st.expander("Maintenance: Backfill text_norm for this document"):
-        st.caption("Use this if you indexed pages before this update so older rows get `text_norm`.")
-        if st.button("Backfill now"):
-            try:
-                docname = st.session_state.get("document_name", "")
-                if not docname:
-                    st.warning("No document selected.")
-                else:
-                    total_updated = 0
-                    page = 0
-                    page_size = 500
-                    while True:
-                        q = (_supa.table("document_chunks")
-                             .select("id,text")
-                             .eq("document_name", docname)
-                             .range(page * page_size, page * page_size + page_size - 1))
-                        res = q.execute()
-                        rows = res.data or []
-                        if not rows:
-                            break
-                        for r in rows:
-                            tid = r["id"]; raw = r.get("text") or ""
-                            tn = normalize_text(raw)
-                            _supa.table("document_chunks").update({"text_norm": tn}).eq("id", tid).execute()
-                            total_updated += 1
-                        page += 1
-                    st.success(f"Backfilled text_norm for {total_updated} rows in '{docname}'.")
-            except Exception as e:
-                st.error("Backfill failed.")
-                st.exception(e)
-
-# ---------------- Helpers: local fuzzy + semantic fallback ----------------
+# ===================== Helpers: local fuzzy/semantic =====
 def local_fuzzy_search(rows: List[Dict[str, Any]], query: str, top_k: int = 50) -> List[Dict[str, Any]]:
-    """
-    Fuzzy search across rows (each with text_norm). Uses rapidfuzz.partial_ratio if available,
-    else Python difflib fallback (slower).
-    """
     qn = normalize_text(query)
     if not qn:
         return []
     results = []
     use_rf = partial_ratio is not None
-    # Prefilter by token presence to reduce work
     tokens = [t for t in qn.split() if len(t) >= 3]
     for r in rows:
         tn = normalize_text(r.get("text", ""))
         if tokens and not any(t in tn for t in tokens):
             continue
-        if use_rf:
-            score = partial_ratio(qn, tn)
-        else:
-            # simple heuristic if rapidfuzz not installed
-            score = 100 if qn in tn else (80 if tn.find(tokens[0]) >= 0 else 0) if tokens else (100 if qn in tn else 0)
+        score = partial_ratio(qn, tn) if use_rf else (100 if qn in tn else 0)
         results.append({**r, "sim": float(score) / 100.0})
     results.sort(key=lambda x: (-x.get("sim", 0.0), x.get("document_name", ""), x.get("page_number") or 0))
     return results[:top_k]
@@ -540,15 +482,11 @@ def local_semantic_search(rows: List[Dict[str, Any]], query_vec: np.ndarray, top
     embs = [np.array(r["embedding"], dtype=np.float32) for r in rows if r.get("embedding") is not None]
     if not embs:
         return []
-    M = np.vstack(embs)
-    M /= (np.linalg.norm(M, axis=1, keepdims=True) + 1e-12)
-    q = query_vec.astype(np.float32)
-    q /= (np.linalg.norm(q) + 1e-12)
+    M = np.vstack(embs); M /= (np.linalg.norm(M, axis=1, keepdims=True) + 1e-12)
+    q = query_vec.astype(np.float32); q /= (np.linalg.norm(q) + 1e-12)
     sims = M @ q
     idxs = np.argsort(-sims)[:top_k]
-    # Need to map back to rows; ensure alignment
-    kept = []
-    j = 0
+    kept, j = [], 0
     for r in rows:
         if r.get("embedding") is None:
             continue
@@ -558,52 +496,25 @@ def local_semantic_search(rows: List[Dict[str, Any]], query_vec: np.ndarray, top
     kept.sort(key=lambda x: (-x.get("sim", 0.0), x.get("document_name", ""), x.get("page_number") or 0))
     return kept
 
-# ---------------- STEP 3: Search (Keyword / Fuzzy / Semantic) ----------------
+# ===================== STEP 3: Search ====================
 st.header("Step 3: Search (Keyword / Semantic)")
 
 if not _supa:
     st.info("Configure Supabase first to enable search.")
 else:
-    # Optional: filter by document
     try:
         docs = _supa.table("document_chunks").select("document_name").execute()
         doc_names = sorted({r["document_name"] for r in (docs.data or []) if r.get("document_name")})
     except Exception:
         doc_names = []
     selected_doc = st.selectbox("Limit to document (optional)", ["All"] + doc_names)
+    only_flagged = st.checkbox("Only show pages with OCR flags (QA)", value=False)
 
     query = st.text_input("Enter your query (e.g., Gen. Transporting)")
-    mode = st.radio(
-        "Search type",
-        ["Keyword (exact/normalized)", "Keyword (fuzzy)", "Semantic (meaning match)"],
-        index=0
-    )
+    mode = st.radio("Search type", ["Keyword (exact/normalized)", "Keyword (fuzzy)", "Semantic (meaning match)"], index=0)
     top_k = st.slider("Results to show", 5, 200, 50)
     fetch_all = st.checkbox("Return all matches (only applies to exact/normalized)")
-    max_scan = st.number_input("Max rows to scan in local fuzzy/semantic fallback", 100, 20000, 5000, step=100)
-
-    # Quick checks
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Check row count"):
-            try:
-                res = _supa.table("document_chunks").select("id", count="exact").limit(1).execute()
-                st.write(f"Row count: {res.count}")
-            except Exception as e:
-                st.error(f"Count failed: {e}")
-    with c2:
-        if st.button("Show 3 most recent rows"):
-            try:
-                res = (
-                    _supa.table("document_chunks")
-                    .select("document_name,page_number,text")
-                    .order("id", desc=True)  # newest first (valid kwarg)
-                    .limit(3)
-                    .execute()
-                )
-                st.write(res.data)
-            except Exception as e:
-                st.error(f"Preview failed: {e}")
+    max_scan = st.number_input("Max rows to scan for local fallback", 100, 20000, 5000, step=100)
 
     if st.button("3) Search", type="primary"):
         if not query:
@@ -611,117 +522,71 @@ else:
         else:
             try:
                 results: List[Dict[str, Any]] = []
-                total = None
+                filter_base = _supa.table("document_chunks").select("document_name,page_number,text", count="exact")
+                if selected_doc != "All":
+                    filter_base = filter_base.eq("document_name", selected_doc)
+                if only_flagged:
+                    filter_base = filter_base.not_.cs("ocr_flags", "{}")  # flags not empty
 
                 if mode.startswith("Keyword (exact/normalized)"):
-                    # Exact-ish: search raw TEXT and TEXT_NORM with ILIKE (fast & simple)
                     norm_query = normalize_text(query)
                     oq = escape_for_or_filter(query)
                     onq = escape_for_or_filter(norm_query)
-
-                    base = _supa.table("document_chunks").select("document_name,page_number,text", count="exact")
-                    base = base.or_(f"text.ilike.%{oq}%,text_norm.ilike.%{onq}%")
-                    if selected_doc != "All":
-                        base = base.eq("document_name", selected_doc)
-
+                    base = filter_base.or_(f"text.ilike.%{oq}%,text_norm.ilike.%{onq}%")
                     if fetch_all:
                         page_size = 100
-                        first = (
-                            base.order("document_name")
-                                .order("page_number")
-                                .range(0, page_size - 1).execute()
-                        )
+                        first = base.order("document_name").order("page_number").range(0, page_size - 1).execute()
                         total = getattr(first, "count", None)
                         results = list(first.data or [])
                         offset = page_size
                         while total is not None and offset < total:
-                            chunk = (
-                                base.order("document_name")
-                                    .order("page_number")
-                                    .range(offset, min(offset + page_size - 1, total - 1))
-                                    .execute()
-                            )
-                            results.extend(chunk.data or [])
-                            offset += page_size
+                            chunk = base.order("document_name").order("page_number").range(offset, min(offset + page_size - 1, total - 1)).execute()
+                            data = chunk.data or []
+                            if not data:
+                                break
+                            results.extend(data)
+                            offset += len(data)
                     else:
                         res = base.order("document_name").order("page_number").limit(top_k).execute()
                         results = getattr(res, "data", []) or []
-                        total = getattr(res, "count", None)
-
-                    results.sort(key=lambda r: (r.get("document_name", ""), r.get("page_number") or 0))
-                    st.write(f"Matches found: {total if total is not None else len(results)}")
 
                 elif mode.startswith("Keyword (fuzzy)"):
                     norm_query = normalize_text(query)
-
-                    # Try RPC first (if you created pg_trgm functions)
                     rpc_ok = True
                     try:
                         if selected_doc == "All":
-                            res = _supa.rpc("fuzzy_find_chunks_all",
-                                            {"qnorm": norm_query, "limit_n": top_k}).execute()
+                            res = _supa.rpc("fuzzy_find_chunks_all", {"qnorm": norm_query, "limit_n": top_k}).execute()
                         else:
-                            res = _supa.rpc("fuzzy_find_chunks_in_doc",
-                                            {"docname": selected_doc, "qnorm": norm_query, "limit_n": top_k}).execute()
+                            res = _supa.rpc("fuzzy_find_chunks_in_doc", {"docname": selected_doc, "qnorm": norm_query, "limit_n": top_k}).execute()
                         results = getattr(res, "data", []) or []
-                        # Fields from RPC: document_name, page_number, text, sim
                         results.sort(key=lambda r: (-r.get("sim", 0.0), r.get("document_name", ""), r.get("page_number") or 0))
-                        st.write(f"Top {len(results)} fuzzy matches (server-side).")
                     except Exception:
                         rpc_ok = False
 
-                    # Local fallback if RPC not available
                     if not rpc_ok:
-                        # Fetch candidates
-                        if selected_doc == "All":
-                            # Page through to max_scan
-                            fetched: List[Dict[str, Any]] = []
-                            offset = 0
-                            page_size = 1000
-                            while offset < max_scan:
-                                chunk = (
-                                    _supa.table("document_chunks")
-                                    .select("document_name,page_number,text")
-                                    .order("document_name")
-                                    .order("page_number")
-                                    .range(offset, offset + page_size - 1)
-                                    .execute()
-                                )
-                                data = chunk.data or []
-                                if not data:
-                                    break
-                                fetched.extend(data)
-                                offset += len(data)
-                                if len(fetched) >= max_scan:
-                                    break
-                            results = local_fuzzy_search(fetched, query, top_k=top_k)
-                        else:
-                            # Restrict to one document
-                            fetched = []
-                            offset = 0
-                            page_size = 2000
-                            while offset < max_scan:
-                                chunk = (
-                                    _supa.table("document_chunks")
-                                    .select("document_name,page_number,text")
-                                    .eq("document_name", selected_doc)
-                                    .order("page_number")
-                                    .range(offset, offset + page_size - 1)
-                                    .execute()
-                                )
-                                data = chunk.data or []
-                                if not data:
-                                    break
-                                fetched.extend(data)
-                                offset += len(data)
-                                if len(fetched) >= max_scan:
-                                    break
-                            results = local_fuzzy_search(fetched, query, top_k=top_k)
-
-                        st.write(f"Top {len(results)} fuzzy matches (local fallback).")
+                        # local fallback, optionally filter flagged
+                        fetched = []
+                        offset = 0
+                        page_size = 1000
+                        while offset < max_scan:
+                            q = _supa.table("document_chunks").select("document_name,page_number,text")
+                            if selected_doc != "All":
+                                q = q.eq("document_name", selected_doc)
+                            if only_flagged:
+                                q = q.not_.cs("ocr_flags", "{}")
+                            q = q.order("document_name").order("page_number").range(offset, offset + page_size - 1)
+                            chunk = q.execute()
+                            data = chunk.data or []
+                            if not data:
+                                break
+                            fetched.extend(data)
+                            offset += len(data)
+                            if len(fetched) >= max_scan:
+                                break
+                        results = local_fuzzy_search(fetched, query, top_k=top_k)
 
                 else:
-                    # Semantic (RPC first, local fallback else)
+                    # Semantic
                     model = load_embedding_model()
                     qv = model.encode([query])[0].astype(np.float32)
                     qv /= (np.linalg.norm(qv) + 1e-12)
@@ -729,23 +594,15 @@ else:
                     rpc_ok = True
                     try:
                         if selected_doc == "All":
-                            res = _supa.rpc(
-                                "find_similar_chunks",
-                                {"query_embedding": qv.tolist(), "match_count": top_k},
-                            ).execute()
+                            res = _supa.rpc("find_similar_chunks", {"query_embedding": qv.tolist(), "match_count": top_k}).execute()
                         else:
-                            res = _supa.rpc(
-                                "find_similar_chunks_in_doc",
-                                {"doc_name": selected_doc, "query_embedding": qv.tolist(), "match_count": top_k},
-                            ).execute()
+                            res = _supa.rpc("find_similar_chunks_in_doc", {"doc_name": selected_doc, "query_embedding": qv.tolist(), "match_count": top_k}).execute()
                         results = getattr(res, "data", []) or []
                         results.sort(key=lambda r: (r.get("document_name", ""), r.get("page_number") or 0))
-                        st.write(f"Top {len(results)} semantic matches (server-side).")
                     except Exception:
                         rpc_ok = False
 
                     if not rpc_ok:
-                        # Local semantic: fetch embeddings and score
                         fetched = []
                         offset = 0
                         page_size = 500
@@ -753,26 +610,24 @@ else:
                             q = _supa.table("document_chunks").select("document_name,page_number,text,embedding")
                             if selected_doc != "All":
                                 q = q.eq("document_name", selected_doc)
+                            if only_flagged:
+                                q = q.not_.cs("ocr_flags", "{}")
                             q = q.order("document_name").order("page_number").range(offset, offset + page_size - 1)
                             chunk = q.execute()
                             data = chunk.data or []
                             if not data:
                                 break
-                            # keep only rows with embeddings
                             fetched.extend([d for d in data if isinstance(d.get("embedding"), list)])
                             offset += len(data)
                             if len(fetched) >= max_scan:
                                 break
                         results = local_semantic_search(fetched, qv, top_k=top_k)
-                        st.write(f"Top {len(results)} semantic matches (local fallback).")
 
-                # Render results
                 if not results:
                     st.info("No results found.")
                 else:
                     for i, r in enumerate(results, 1):
-                        doc = r.get("document_name", "Unknown")
-                        page = r.get("page_number", "?")
+                        doc = r.get("document_name", "Unknown"); page = r.get("page_number", "?")
                         text = (r.get("text") or "").replace("\n", " ")
                         snippet = text[:400] + ("..." if len(text) > 400 else "")
                         st.markdown(f"**{i}. {doc} — Page {page}**")
@@ -780,170 +635,212 @@ else:
                         if "sim" in r:
                             st.caption(f"Similarity: {r['sim']:.3f}")
                         st.divider()
-
             except Exception as e:
                 st.error("Search failed.")
                 st.exception(e)
 
-# ===================== STEP 4: Page Inspector & Re-OCR (single-page fix) =====================
-st.header("Step 4: Page Inspector & Re-OCR (single-page fix)")
+# ===================== STEP 4: QA Dashboard ==============
+st.header("Step 4: QA Dashboard (find pages that need attention)")
 
 if not _supa:
-    st.info("Configure Supabase first (add SUPABASE_URL and SUPABASE_ANON_KEY to Secrets).")
+    st.info("Configure Supabase first.")
 else:
-    # Quick debug row so you know you're on the latest build and we have the PDF in memory
-    dbg1, dbg2, dbg3 = st.columns(3)
-    with dbg1:
-        st.caption(f"Build: {BUILD_ID}")
-    with dbg2:
-        st.caption("Last uploaded PDF: " + (st.session_state.get("last_pdf_name") or "none"))
+    colq1, colq2 = st.columns(2)
+    with colq1:
+        sel_doc = st.selectbox("Filter by document (optional)", ["All"] + (doc_names if 'doc_names' in locals() else []), key="qa_doc")
+    with colq2:
+        min_conf = st.slider("Min acceptable confidence", 0, 100, 65)
+    show_btn = st.button("List flagged pages")
+
+    if show_btn:
+        try:
+            # flagged = has any flags OR fails numeric thresholds
+            q = _supa.table("document_chunks").select(
+                "document_name,page_number,avg_conf,text_len,non_alnum_ratio,ocr_engine,ocr_psm,ocr_zoom,ocr_attempts,ocr_flags"
+            )
+            if sel_doc != "All":
+                q = q.eq("document_name", sel_doc)
+            q = q.or_(f"avg_conf.lt.{min_conf},text_len.lte.10,not.ocr_flags.cs.{{}}")
+            q = q.order("document_name").order("page_number").limit(2000)
+            res = q.execute()
+            rows = res.data or []
+            if not rows:
+                st.success("No flagged pages 🎉")
+            else:
+                df = pd.DataFrame(rows)
+                st.write(df)
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button("Download CSV", data=csv, file_name="ocr_flagged_pages.csv", mime="text/csv")
+        except Exception as e:
+            st.error("Query failed.")
+            st.exception(e)
+
+    st.subheader("Batch re-OCR a single document’s flagged pages (using the PDF you just uploaded)")
+    st.caption("To enable re-OCR here, upload the same PDF in Step 1 and process it so the app has the bytes in memory.")
+    if st.button("Re-OCR flagged pages of last uploaded PDF (and update DB)"):
+        try:
+            docname = st.session_state.get("last_pdf_name")
+            file_bytes = st.session_state.get("last_pdf_bytes")
+            if not docname or not file_bytes:
+                st.warning("No PDF in memory. Upload & Process in Step 1 first.")
+            else:
+                # Fetch flagged pages for this doc
+                q = (_supa.table("document_chunks")
+                     .select("id,page_number")
+                     .eq("document_name", docname)
+                     .or_(f"avg_conf.lt.65,text_len.lte.10,not.ocr_flags.cs.{{}}")
+                     .order("page_number")
+                     .limit(5000))
+                flagged = q.execute().data or []
+                if not flagged:
+                    st.info("No flagged pages for this document.")
+                else:
+                    doc = fitz.open(stream=file_bytes, filetype="pdf")
+                    model = load_embedding_model()
+                    updated = 0
+                    prog = st.progress(0, text="Re-OCR 0 pages")
+                    for i, row in enumerate(flagged, 1):
+                        pno = row["page_number"]
+                        if 1 <= pno <= len(doc):
+                            page = doc[pno - 1]
+                            cand = ocr_page_auto(page, preset, user_words_path, base_zoom, timeout_sec, use_trocr, max_attempts=4)
+                            vec = model.encode([cand["text"]])[0].astype(np.float32)
+                            vec /= (np.linalg.norm(vec) + 1e-12)
+                            m = qc_metrics(cand["text_norm"])
+                            _supa.table("document_chunks").update({
+                                "text": cand["text"],
+                                "text_norm": cand["text_norm"],
+                                "avg_conf": float(cand["avg_conf"]),
+                                "text_len": int(m["text_len"]),
+                                "non_alnum_ratio": float(m["non_alnum_ratio"]),
+                                "ocr_engine": cand["ocr_engine"],
+                                "ocr_psm": cand["ocr_psm"],
+                                "ocr_zoom": cand["ocr_zoom"],
+                                "ocr_attempts": cand["ocr_attempts"],
+                                "ocr_flags": cand["flags"],
+                                "embedding": vec.tolist(),
+                                "last_ocr_at": "now()",
+                            }).eq("id", row["id"]).execute()
+                            updated += 1
+                        prog.progress(i/len(flagged), text=f"Re-OCR {i}/{len(flagged)} pages")
+                    doc.close()
+                    st.success(f"Re-OCR complete. Updated {updated} pages.")
+        except Exception as e:
+            st.error("Batch re-OCR failed.")
+            st.exception(e)
+
+# ===================== Page Inspector (manual fix) =======
+st.header("Step 5: Page Inspector & Re-OCR (single page)")
+if not _supa:
+    st.info("Configure Supabase first.")
+else:
     try:
         _docs = _supa.table("document_chunks").select("document_name").execute()
         _doc_names = sorted({r["document_name"] for r in (_docs.data or []) if r.get("document_name")})
     except Exception:
         _doc_names = []
-    with dbg3:
-        st.caption(f"Docs in DB: {len(_doc_names)}")
+    doc_to_fix = st.selectbox("Select document", _doc_names, key="ins_doc")
+    page_to_fix = st.number_input("Page number", min_value=1, value=3, step=1, key="ins_page")
+    query_debug = st.text_input("Keyword test (optional)", value="Gen. Transporting", key="ins_q")
+    colA, colB = st.columns(2)
 
-    if not _doc_names:
-        st.info("No documents found in Supabase. Run Step 2 (Embed & Upload) first.")
-    else:
-        doc_to_fix = st.selectbox("Select document to inspect", _doc_names, key="ins_doc")
-        page_to_fix = st.number_input("Page number to inspect", min_value=1, value=3, step=1, key="ins_page")
-        query_debug = st.text_input("Optional: test against this keyword", value="Gen. Transporting", key="ins_q")
-
-        colA, colB = st.columns(2)
-
-        # --- Left: fetch the row currently stored in Supabase
-        with colA:
-            if st.button("Fetch row from Supabase", key="btn_fetch_row"):
-                try:
-                    r = (_supa.table("document_chunks")
-                         .select("id,document_name,page_number,text,embedding")
-                         .eq("document_name", doc_to_fix)
-                         .eq("page_number", page_to_fix)
-                         .limit(1).execute())
-                    row = (r.data or [None])[0]
-                    if not row:
-                        st.error("No row found for that document/page.")
-                    else:
-                        st.session_state["_inspect_row"] = row
-                        raw = row.get("text") or ""
-                        norm = normalize_text(raw)
-                        st.success("Row loaded.")
-                        st.markdown("**Raw OCR text (first 800 chars):**")
-                        st.write((raw[:800] + ("..." if len(raw) > 800 else "")) or "_(empty)_")
-                        st.markdown("**Normalized text (first 800 chars):**")
-                        st.write((norm[:800] + ("..." if len(norm) > 800 else "")) or "_(empty)_")
-
-                        if query_debug:
-                            qn = normalize_text(query_debug)
-                            contains_raw = query_debug.lower() in raw.lower()
-                            contains_norm = qn in norm
-                            st.write(f"Contains (raw) = {contains_raw}  |  Contains (normalized) = {contains_norm}")
-                            try:
-                                from rapidfuzz.fuzz import partial_ratio
-                                score = partial_ratio(qn, norm) / 100.0
-                                st.write(f"Fuzzy score (partial_ratio vs normalized): {score:.3f}")
-                            except Exception:
-                                st.caption("Install rapidfuzz for fuzzy score in-app (optional).")
-                except Exception as e:
-                    st.error("Fetch failed.")
-                    st.exception(e)
-
-        # --- Right: re-OCR this exact page using tougher settings (DPI/PSM variants)
-        with colB:
-            if st.button("Try Re-OCR Variants (tougher settings)", key="btn_reocr"):
-                bytes_ok = (
-                    st.session_state.get("last_pdf_bytes") is not None
-                    and st.session_state.get("last_pdf_name") == doc_to_fix
-                )
-                if not bytes_ok:
-                    st.warning("Re-upload this exact PDF in Step 1 (same file name) and click 'Process PDF', then come back.")
+    with colA:
+        if st.button("Fetch row", key="btn_fetch_row"):
+            try:
+                r = (_supa.table("document_chunks")
+                     .select("id,document_name,page_number,text,avg_conf,text_len,ocr_flags")
+                     .eq("document_name", doc_to_fix)
+                     .eq("page_number", page_to_fix)
+                     .limit(1).execute())
+                row = (r.data or [None])[0]
+                if not row:
+                    st.error("No row found.")
                 else:
-                    try:
-                        pdf_bytes = st.session_state["last_pdf_bytes"]
-                        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-                        if page_to_fix < 1 or page_to_fix > len(doc):
-                            st.error(f"PDF has {len(doc)} pages — page {page_to_fix} is out of range.")
-                        else:
-                            page = doc[page_to_fix - 1]
-                            variants = [
-                                ("eng", "6", 3.0),
-                                ("eng", "7", 3.5),
-                                ("eng", "11", 3.5),
-                                ("eng", "4", 4.0),   # block layout
-                            ]
-                            user_words_path = None
-                            tried = []
-                            for lang, psm, zoom in variants:
-                                txt, conf = tesseract_ocr(
-                                    page, zoom=float(zoom), lang=lang, psm=psm,
-                                    do_denoise=True, do_autocontrast=True, binarize=True, thresh=175,
-                                    user_words_path=user_words_path, timeout_sec=25
-                                )
-                                nrm = normalize_text(txt)
-                                score = 0.0
-                                if query_debug:
-                                    try:
-                                        from rapidfuzz.fuzz import partial_ratio
-                                        score = partial_ratio(normalize_text(query_debug), nrm) / 100.0
-                                    except Exception:
-                                        score = 1.0 if normalize_text(query_debug) in nrm else 0.0
-                                tried.append({
-                                    "lang": lang, "psm": psm, "zoom": zoom,
-                                    "conf": conf, "len": len(nrm), "score": score,
-                                    "text": txt, "text_norm": nrm,
-                                })
-                            doc.close()
+                    st.session_state["_inspect_row"] = row
+                    raw = row.get("text") or ""
+                    norm = normalize_text(raw)
+                    st.success(f"Row loaded. conf={row.get('avg_conf')}, len={row.get('text_len')}, flags={row.get('ocr_flags')}")
+                    st.write((raw[:800] + ("..." if len(raw) > 800 else "")) or "_(empty)_")
+                    if query_debug:
+                        qn = normalize_text(query_debug)
+                        contains_raw = query_debug.lower() in raw.lower()
+                        contains_norm = qn in norm
+                        st.caption(f"Contains(raw)={contains_raw} | Contains(norm)={contains_norm}")
+            except Exception as e:
+                st.error("Fetch failed.")
+                st.exception(e)
 
-                            tried.sort(key=lambda d: (-d["score"], -d["len"], -d["conf"]))
-                            st.success(f"Tried {len(tried)} variants. Showing top 3:")
-                            for i, cand in enumerate(tried[:3], 1):
-                                st.markdown(
-                                    f"**#{i} lang={cand['lang']} psm={cand['psm']} zoom={cand['zoom']} "
-                                    f"(score={cand['score']:.3f}, conf={cand['conf']:.1f}, len={cand['len']})**"
-                                )
-                                prev = cand["text_norm"][:500] + ("..." if len(cand["text_norm"]) > 500 else "")
-                                st.write(prev or "_(empty)_")
-
-                            st.session_state["_re_ocr_candidates"] = tried
-                    except Exception as e:
-                        st.error("Re-OCR failed.")
-                        st.exception(e)
-
-        # --- Save chosen re-OCR back to Supabase (also refresh embedding)
-        row = st.session_state.get("_inspect_row")
-        cands = st.session_state.get("_re_ocr_candidates", [])
-        if row and cands:
-            labels = [
-                f"#{i+1}: lang={d['lang']} psm={d['psm']} zoom={d['zoom']} "
-                f"(score={d['score']:.3f}, conf={d['conf']:.1f})"
-                for i, d in enumerate(cands[:5])
-            ]
-            pick = st.selectbox("Pick a candidate to save", labels, key="pick_cand")
-            idx = labels.index(pick)
-            chosen = cands[idx]
-            if st.button("✅ Update this page in Supabase (text + text_norm + embedding)", key="btn_update_page"):
+    with colB:
+        if st.button("Try Re-OCR Variants", key="btn_reocr"):
+            ok = (st.session_state.get("last_pdf_bytes") is not None and st.session_state.get("last_pdf_name") == doc_to_fix)
+            if not ok:
+                st.warning("Re-upload this exact PDF in Step 1 and click Process PDF, then return.")
+            else:
                 try:
-                    model = load_embedding_model()
-                    vec = model.encode([chosen["text"]])[0].astype(np.float32)
-                    vec /= (np.linalg.norm(vec) + 1e-12)
-                    _supa.table("document_chunks").update({
-                        "text": chosen["text"],
-                        "text_norm": chosen["text_norm"],
-                        "embedding": vec.tolist(),
-                    }).eq("id", row["id"]).execute()
-                    st.success("Page updated. Re-run your search in Step 3.")
+                    pdf_bytes = st.session_state["last_pdf_bytes"]
+                    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                    if page_to_fix < 1 or page_to_fix > len(doc):
+                        st.error(f"PDF has {len(doc)} pages — page {page_to_fix} out of range.")
+                    else:
+                        page = doc[page_to_fix - 1]
+                        variants = [
+                            ("eng", "6", 3.0),
+                            ("eng", "7", 3.5),
+                            ("eng", "11", 3.5),
+                            ("eng", "4", 4.0),
+                        ]
+                        tried = []
+                        for lang, psm, zoom in variants:
+                            txt, conf = tesseract_ocr(page, zoom=float(zoom), lang=lang, psm=psm,
+                                                      user_words_path=None, timeout_sec=25)
+                            nrm = normalize_text(txt)
+                            tried.append({"lang": lang, "psm": psm, "zoom": zoom, "conf": conf, "len": len(nrm), "text_norm": nrm, "text": txt})
+                        doc.close()
+                        tried.sort(key=lambda d: (-d["len"], -d["conf"]))
+                        for i, cand in enumerate(tried[:3], 1):
+                            st.markdown(f"**#{i} lang={cand['lang']} psm={cand['psm']} zoom={cand['zoom']} (conf={cand['conf']:.1f}, len={cand['len']})**")
+                            st.write(cand["text_norm"][:500] + ("..." if len(cand["text_norm"]) > 500 else ""))
+                        st.session_state["_re_ocr_candidates"] = tried
                 except Exception as e:
-                    st.error("Update failed.")
+                    st.error("Re-OCR failed.")
                     st.exception(e)
 
-# ---------------- Footer ----------------
+    row = st.session_state.get("_inspect_row")
+    cands = st.session_state.get("_re_ocr_candidates", [])
+    if row and cands:
+        labels = [f"#{i+1}: {d['lang']} psm={d['psm']} zoom={d['zoom']} (conf={d['conf']:.1f}, len={d['len']})" for i, d in enumerate(cands[:5])]
+        pick = st.selectbox("Pick a candidate to save", labels, key="pick_cand")
+        idx = labels.index(pick); chosen = cands[idx]
+        if st.button("✅ Update this page", key="btn_update_page"):
+            try:
+                model = load_embedding_model()
+                vec = model.encode([chosen["text"]])[0].astype(np.float32)
+                vec /= (np.linalg.norm(vec) + 1e-12)
+                m = qc_metrics(normalize_text(chosen["text"]))
+                _supa.table("document_chunks").update({
+                    "text": chosen["text"],
+                    "text_norm": normalize_text(chosen["text"]),
+                    "avg_conf": float(chosen["conf"]),
+                    "text_len": int(m["text_len"]),
+                    "non_alnum_ratio": float(m["non_alnum_ratio"]),
+                    "ocr_engine": "tesseract",
+                    "ocr_psm": int(chosen["psm"]),
+                    "ocr_zoom": float(chosen["zoom"]),
+                    "ocr_attempts": 1,
+                    "ocr_flags": make_flags(float(chosen["conf"]), normalize_text(chosen["text"]), "English (printed)"),
+                    "embedding": vec.tolist(),
+                    "last_ocr_at": "now()",
+                }).eq("id", row["id"]).execute()
+                st.success("Updated. Re-run search.")
+            except Exception as e:
+                st.error("Update failed.")
+                st.exception(e)
+
+# ===================== Footer ============================
 with st.expander("Notes & Tips"):
     st.markdown(
-        "- Keyword search hits both **raw** and **normalized** text (hyphenation joined, zero-width removed, quotes/dashes normalized).\n"
-        "- **Fuzzy** search uses Postgres `pg_trgm` RPC if present; otherwise it falls back to a local fuzzy scorer (add `rapidfuzz` for speed).\n"
-        "- For long PDFs, set **Limit pages** for quick tests; enable **Intensive** if a page looks under-read.\n"
-        "- Ensure RLS is disabled or anon policies allow INSERT/SELECT on `document_chunks`."
+        "- Ingestion auto-retries OCR with tougher settings until page meets thresholds.\n"
+        "- QA flags stored per page: `low_conf`, `very_short`, `noisy_text`, `empty`, `error`.\n"
+        "- Use **Step 4** to list/export flagged pages across docs; use batch re-OCR for the currently uploaded PDF.\n"
+        "- Ensure RLS allows anon INSERT/SELECT (or disable RLS) on `document_chunks`."
     )
