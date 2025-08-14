@@ -1,1 +1,6 @@
 tesseract-ocr
+tesseract-ocr-fra
+tesseract-ocr-ara
+tesseract-ocr-deu
+tesseract-ocr-chi-sim   # Chinese Simplified (chi_sim)
+tesseract-ocr-chi-tra   # Chinese Traditional (chi_tra)
