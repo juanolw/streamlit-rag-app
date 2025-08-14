@@ -1,6 +1,5 @@
-# app.py — Pro UI polish + Quick Actions + sticky footer
-# Pipeline: PDF → OCR (auto-QA) → normalize → embed → Supabase → search
-# NOTE: No 'asc=' anywhere (compatible with supabase-py >= 2.5)
+# app.py — Single sleek tab bar (Apple-like), OCR → Embeddings → Supabase → Search + QA
+# NOTE: Compatible with supabase-py >= 2.5; no use of 'asc=' in .order()
 
 import io
 import re
@@ -22,162 +21,129 @@ from supabase import create_client, ClientOptions
 import supabase as _sb
 import altair as alt
 
-# Optional: fuzzy fallback
+# Optional fuzzy
 try:
     from rapidfuzz.fuzz import partial_ratio
 except Exception:
     partial_ratio = None
 
-BUILD_ID = "pro-ui-quick-actions-2025-08-14"
+BUILD_ID = "one-bar-pro-2025-08-14"
+
 st.set_page_config(
-    page_title="RAG (Ingest | Search | QA)",
+    page_title="RAG • OCR | Search | QA",
     page_icon="📚",
     layout="wide",
-    menu_items={"Get Help": None, "About": "RAG for Construction Claims — OCR, Search & QA"}
+    menu_items={"About": "RAG for Construction Claims — OCR • Search • QA"}
 )
 
-# ---------------- Global CSS (fonts, header, tabs, cards, controls, quick bar, footer) ----------------
+# ---------------- Global CSS: Apple-like minimalist look, single sticky tabs bar ----------------
 st.markdown(
     """
 <style>
-/* Google Font */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
-html, body, [class*="css"] { font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-
-/* Main container spacing */
-.main .block-container { padding-top: 0.5rem; padding-bottom: 3.5rem; }
-
-/* Brand header */
-.brandbar {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: 12px; padding: 16px 20px; margin-bottom: 0.4rem;
-  background: linear-gradient(135deg, rgba(37,99,235,0.08), rgba(124,58,237,0.08));
-  border: 1px solid rgba(49,51,63,0.10); border-radius: 16px;
+/* Font stack (SF-like) */
+@font-face {
+  font-family: "InterVar";
+  src: local("Inter");
 }
-.brandbar__left { display:flex; align-items:center; gap:12px; }
-.brandbar__logo {
-  width: 36px; height: 36px; border-radius: 10px;
-  background: linear-gradient(135deg, #2563eb, #7c3aed);
-  display:flex; align-items:center; justify-content:center; color:white; font-weight:700;
+:root {
+  --bg: var(--background-color);
+  --bg-2: var(--secondary-background-color);
+  --border: rgba(49,51,63,0.14);
+  --glow: 0 6px 24px rgba(0,0,0,0.06);
+  --ring: 0 0 0 3px rgba(37, 99, 235, 0.12);
 }
-.brandbar__title { font-size: 1.15rem; font-weight: 700; margin:0; }
-.brandbar__subtitle { font-size: 0.9rem; opacity: 0.8; margin:0; }
-.brandbar__right { display:flex; gap:8px; }
-.brandbar__chip {
-  padding: 6px 10px; border-radius: 999px; font-size: 0.8rem; font-weight: 600;
-  background: var(--secondary-background-color); border: 1px solid rgba(49,51,63,0.12);
+html, body, [class*="css"] {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, system-ui, sans-serif;
 }
 
-/* Quick Actions bar */
-.qbar {
-  position: sticky; top: 6px; z-index: 20;
-  display:flex; gap:10px; align-items:center; padding: 8px 10px; margin: 8px 0 14px;
-  background: var(--background-color); border: 1px solid rgba(49,51,63,0.12); border-radius: 999px;
-}
-.qbtn {
-  display:inline-flex; align-items:center; gap:8px;
-  border: 1px solid rgba(49,51,63,0.18);
-  background: var(--secondary-background-color);
-  padding: 8px 14px; border-radius: 999px; font-weight: 700; cursor: pointer; user-select:none;
-}
-.qbtn--primary {
-  background: linear-gradient(135deg, #2563eb, #7c3aed); color: white; border-color: transparent;
-  box-shadow: 0 2px 10px rgba(37,99,235,0.25);
+/* Tighter container + generous breathing room */
+.main .block-container { padding-top: 0.8rem; padding-bottom: 4.2rem; }
+
+/* SINGLE sticky nav (the tabs themselves) */
+.stTabs {
+  position: sticky; top: 6px; z-index: 50;
+  padding: 6px 8px; margin-top: 4px; margin-bottom: 14px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  backdrop-filter: blur(10px);
+  box-shadow: var(--glow);
 }
 
-/* Bigger, pill-style tabs */
+/* Large pill tabs */
+.stTabs [role="tablist"] { gap: 10px; }
 .stTabs [role="tab"] {
-  background-color: var(--secondary-background-color);
+  background: var(--bg-2);
   padding: 12px 18px;
-  margin-right: 10px;
   border-radius: 999px;
-  font-weight: 600;
+  font-weight: 700;
   font-size: 1rem;
-  border: 1px solid rgba(49,51,63,0.18);
+  border: 1px solid var(--border);
+  transition: transform .15s ease;
 }
+.stTabs [role="tab"]:hover { transform: translateY(-1px); border-color: rgba(49,51,63,0.28); }
 .stTabs [role="tab"][aria-selected="true"] {
-  background: linear-gradient(135deg, #2563eb, #7c3aed);
   color: white;
+  background: linear-gradient(135deg, #111827, #1f2937);
   border-color: transparent;
-  box-shadow: 0 2px 10px rgba(37,99,235,0.25);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.18);
 }
-.stTabs [role="tab"]:hover { border-color: rgba(49,51,63,0.35); }
 
-/* KPI cards */
-.kpi-card { 
-  border-radius: 16px; padding: 14px 16px; 
-  background: var(--secondary-background-color); 
-  border: 1px solid rgba(49,51,63,0.15);
-}
-.kpi-title { font-size: 0.85rem; color: rgba(49,51,63,0.75); margin-bottom: 6px; }
-.kpi-value { font-size: 1.6rem; font-weight: 700; }
-
-/* Badges */
-.badge { display:inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 600; font-size: 0.75rem; }
-.badge--ok   { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; }
-.badge--warn { background:#fff7ed; color:#9a3412; border:1px solid #fed7aa; }
-.badge--err  { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; }
-
-/* Softer inputs & buttons */
-.stButton > button { 
+/* Inputs & buttons */
+.stButton > button {
   border-radius: 12px; font-weight: 700; padding: 0.5rem 0.9rem;
-  border: 1px solid rgba(49,51,63,0.18);
+  border: 1px solid var(--border);
 }
 .stDownloadButton > button { border-radius: 12px; }
 .stTextInput > div > div > input,
 .stNumberInput input, .stSelectbox div[data-baseweb="select"] > div,
-.stFileUploader { border-radius: 12px !important; border: 1px solid rgba(49,51,63,0.18); }
+.stFileUploader, .stTextArea textarea {
+  border-radius: 12px !important; border: 1px solid var(--border);
+}
 
-/* Code/textarea */
-.stTextArea textarea { border-radius: 12px; }
+/* Cards, badges, kpis */
+.card {
+  border-radius: 16px; padding: 14px 16px; background: var(--bg-2); border: 1px solid var(--border);
+  box-shadow: var(--glow);
+}
+.kpi-title { font-size: 0.85rem; color: rgba(49,51,63,0.75); margin-bottom: 6px; }
+.kpi-value { font-size: 1.6rem; font-weight: 800; letter-spacing: -0.02em; }
 
-/* Dataframe corners */
+.badge { display:inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: 0.75rem; }
+.badge--ok   { background:#ecfdf5; color:#065f46; border:1px solid #a7f3d0; }
+.badge--warn { background:#fff7ed; color:#9a3412; border:1px solid #fed7aa; }
+.badge--err  { background:#fef2f2; color:#991b1b; border:1px solid #fecaca; }
+
+/* Dataframe rounding */
 [data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
 
-/* Sticky footer */
+/* Sticky footer (subtle) */
 .footer {
   position: fixed; left: 18px; right: 18px; bottom: 12px; z-index: 40;
   display:flex; align-items:center; justify-content: space-between; gap:12px;
   padding: 10px 14px; border-radius: 12px;
-  backdrop-filter: blur(8px);
-  background: color-mix(in srgb, var(--background-color) 70%, transparent);
-  border: 1px solid rgba(49,51,63,0.12);
-  font-size: 0.85rem;
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  border: 1px solid var(--border); backdrop-filter: blur(8px);
+  font-size: 0.85rem; box-shadow: var(--glow);
 }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# ---------------- Brand header ----------------
-st.markdown(
-    f"""
-<div class="brandbar">
-  <div class="brandbar__left">
-    <div class="brandbar__logo">R</div>
-    <div>
-      <p class="brandbar__title">RAG for Construction Claims</p>
-      <p class="brandbar__subtitle">OCR • Search • QA dashboard</p>
-    </div>
-  </div>
-  <div class="brandbar__right">
-    <div class="brandbar__chip">Build {BUILD_ID}</div>
-    <div class="brandbar__chip">supabase-py {_sb.__version__}</div>
-  </div>
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-# ---------------- Sidebar: environment & OCR options ----------------
+# ---------------- Sidebar: setup & OCR options ----------------
 with st.sidebar:
-    st.header("Setup & OCR Options")
+    st.header("Setup")
+    st.caption(f"Build **{BUILD_ID}** · supabase-py `{_sb.__version__}`")
+
     try:
         langs = pytesseract.get_languages(config="")
         st.caption("Tesseract languages: " + ", ".join(sorted(langs)))
     except Exception:
         st.caption("Tesseract language list unavailable")
 
+    st.markdown("---")
+    st.header("OCR Options")
     preset = st.selectbox(
         "Language preset",
         ["English (printed)", "English (handwritten)", "Arabic (ara)", "Chinese (Simplified)", "Chinese (Traditional)"],
@@ -188,15 +154,15 @@ with st.sidebar:
     timeout_sec = st.slider("OCR timeout per page (sec)", 5, 60, 20)
     use_trocr = st.checkbox("Use TrOCR for English (handwritten)", value=False)
 
-    # Optional domain vocabulary
+    # Optional vocab
     user_words_path = None
     use_vocab = st.checkbox("Use custom vocabulary (.txt)", value=False)
     if use_vocab:
-        vocab_file = st.file_uploader("Upload vocabulary (TXT, one term per line)", type=["txt"], key="user_words")
-        if vocab_file is not None:
+        vf = st.file_uploader("Upload vocabulary (TXT, one term per line)", type=["txt"], key="user_words")
+        if vf is not None:
             user_words_path = Path("user_words.txt").absolute()
             with open(user_words_path, "wb") as f:
-                f.write(vocab_file.read())
+                f.write(vf.read())
             st.caption(f"Custom vocab saved to {user_words_path}")
 
 # ---------------- Supabase client ----------------
@@ -227,8 +193,7 @@ _PUNCT_STRIP_RE = re.compile(r"[.,:;|/\\()\[\]{}<>•·…]+")
 _SPACE_COLLAPSE_RE = re.compile(r"\s+")
 
 def normalize_text(s: str) -> str:
-    if not s:
-        return ""
+    if not s: return ""
     s = s.replace("-\n", "").replace("\n", " ")
     s = s.translate(ZW_REMOVE).translate(PUNCT_MAP)
     s = unicodedata.normalize("NFKC", s)
@@ -251,33 +216,25 @@ def load_trocr_handwritten():
     processor = TrOCRProcessor.from_pretrained("microsoft/trocr-base-handwritten")
     model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-base-handwritten")
     model.eval()
-    device = torch.device("cpu")
-    model.to(device)
+    device = torch.device("cpu"); model.to(device)
     return processor, model, device
 
-# ---------------- OCR engines & QA ----------------
+# ---------------- OCR engines & QA thresholds ----------------
 def render_page_to_image(page, zoom: float = 3.0) -> Image.Image:
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
+    mat = fitz.Matrix(zoom, zoom); pix = page.get_pixmap(matrix=mat, alpha=False)
     return Image.open(io.BytesIO(pix.tobytes("png")))
 
 def preprocess_image(img: Image.Image, do_denoise=True, do_autocontrast=True, binarize=True, thresh=175, to_gray=True):
-    if to_gray:
-        img = img.convert("L")
-    if do_denoise:
-        img = img.filter(ImageFilter.MedianFilter(size=3))
-    if do_autocontrast:
-        img = ImageOps.autocontrast(img)
-    if binarize:
-        img = img.point(lambda p: 255 if p > thresh else 0)
+    if to_gray: img = img.convert("L")
+    if do_denoise: img = img.filter(ImageFilter.MedianFilter(size=3))
+    if do_autocontrast: img = ImageOps.autocontrast(img)
+    if binarize: img = img.point(lambda p: 255 if p > thresh else 0)
     return img
 
 def tesseract_ocr(page, zoom: float, lang: str, psm: str, user_words_path: Optional[str], timeout_sec: int = 20) -> Tuple[str, float]:
-    img = render_page_to_image(page, zoom=zoom)
-    img = preprocess_image(img, True, True, True, 175, to_gray=True)
+    img = render_page_to_image(page, zoom=zoom); img = preprocess_image(img, True, True, True, 175, True)
     config = f"--oem 1 --psm {psm} -c preserve_interword_spaces=1"
-    if user_words_path:
-        config += f" --user-words {user_words_path}"
+    if user_words_path: config += f" --user-words {user_words_path}"
     try:
         data = pytesseract.image_to_data(img, lang=lang, config=config, output_type=TessOutput.DICT, timeout=timeout_sec)
         words = [w for w in data.get("text", []) if isinstance(w, str) and w.strip()]
@@ -304,8 +261,8 @@ def trocr_ocr(page, zoom: float) -> str:
     img = render_page_to_image(page, zoom=zoom).convert("RGB")
     with torch.no_grad():
         inputs = processor(images=img, return_tensors="pt").to(device)
-        generated_ids = model.generate(**inputs, max_length=512)
-        text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        ids = model.generate(**inputs, max_length=512)
+        text = processor.batch_decode(ids, skip_special_tokens=True)[0]
     return (text or "").strip()
 
 THRESH = {
@@ -317,23 +274,16 @@ THRESH = {
 }
 
 def qc_metrics(text_norm: str) -> Dict[str, Any]:
-    n = len(text_norm)
-    alnum = sum(ch.isalnum() for ch in text_norm)
+    n = len(text_norm); alnum = sum(ch.isalnum() for ch in text_norm)
     non_alnum_ratio = 1.0 - (alnum / n) if n else 1.0
     return {"text_len": n, "non_alnum_ratio": non_alnum_ratio}
 
 def make_flags(avg_conf: float, text_norm: str, preset: str) -> List[str]:
-    t = THRESH.get(preset, THRESH["English (printed)"])
-    m = qc_metrics(text_norm)
-    flags = []
-    if avg_conf < t["min_conf"]:
-        flags.append("low_conf")
-    if m["text_len"] < t["min_len"]:
-        flags.append("very_short")
-    if m["non_alnum_ratio"] > t["max_noisy"]:
-        flags.append("noisy_text")
-    if not text_norm:
-        flags.append("empty")
+    t = THRESH.get(preset, THRESH["English (printed)"]); m = qc_metrics(text_norm); flags = []
+    if avg_conf < t["min_conf"]: flags.append("low_conf")
+    if m["text_len"] < t["min_len"]: flags.append("very_short")
+    if m["non_alnum_ratio"] > t["max_noisy"]: flags.append("noisy_text")
+    if not text_norm: flags.append("empty")
     return flags
 
 def ocr_variants_for_preset(preset: str, use_trocr: bool, base_zoom: float):
@@ -343,8 +293,7 @@ def ocr_variants_for_preset(preset: str, use_trocr: bool, base_zoom: float):
                 ("tess-eng", {"lang": "eng", "psm": "11", "zoom": base_zoom + 0.5})]
     if preset == "English (handwritten)":
         v = []
-        if use_trocr:
-            v.append(("trocr", {"zoom": max(3.0, base_zoom)}))
+        if use_trocr: v.append(("trocr", {"zoom": max(3.0, base_zoom)}))
         v += [("tess-eng", {"lang": "eng", "psm": "4",  "zoom": base_zoom + 0.5}),
               ("tess-eng", {"lang": "eng", "psm": "3",  "zoom": base_zoom + 1.0})]
         return v
@@ -359,39 +308,36 @@ def ocr_variants_for_preset(preset: str, use_trocr: bool, base_zoom: float):
                 ("tess", {"lang": "chi_tra", "psm": "3", "zoom": base_zoom + 0.5})]
     return [("tess-eng", {"lang": "eng", "psm": "6", "zoom": base_zoom})]
 
-def ocr_page_auto(page, preset: str, user_words_path: Optional[str], base_zoom: float, timeout_sec: int, use_trocr: bool, max_attempts: int = 3):
+def ocr_page_auto(page, preset: str, user_words_path: Optional[str], base_zoom: float, timeout_sec: int,
+                  use_trocr: bool, max_attempts: int = 3):
     variants = ocr_variants_for_preset(preset, use_trocr, base_zoom)[:max_attempts]
     best = None
     for idx, (engine, cfg) in enumerate(variants, 1):
         if engine == "trocr":
             try:
-                text = trocr_ocr(page, zoom=cfg["zoom"])
-                avg_conf = 65.0
-                text_norm = normalize_text(text)
-                flags = make_flags(avg_conf, text_norm, preset)
+                text = trocr_ocr(page, zoom=cfg["zoom"]); avg_conf = 65.0
+                text_norm = normalize_text(text); flags = make_flags(avg_conf, text_norm, preset)
                 cand = dict(text=text, text_norm=text_norm, avg_conf=avg_conf,
                             ocr_engine="trocr", ocr_psm=None, ocr_zoom=float(cfg["zoom"]),
                             ocr_attempts=idx, flags=flags)
             except Exception:
                 continue
         else:
-            text, avg_conf = tesseract_ocr(page, zoom=float(cfg["zoom"]),
-                                           lang=cfg.get("lang", "eng"), psm=cfg.get("psm", "6"),
-                                           user_words_path=user_words_path, timeout_sec=timeout_sec)
-            text_norm = normalize_text(text)
-            flags = make_flags(avg_conf, text_norm, preset)
+            text, avg_conf = tesseract_ocr(page, float(cfg["zoom"]), cfg.get("lang", "eng"), cfg.get("psm", "6"),
+                                           user_words_path, timeout_sec)
+            text_norm = normalize_text(text); flags = make_flags(avg_conf, text_norm, preset)
             cand = dict(text=text, text_norm=text_norm, avg_conf=avg_conf,
-                        ocr_engine="tesseract", ocr_psm=int(cfg.get("psm", "6")), ocr_zoom=float(cfg["zoom"]),
-                        ocr_attempts=idx, flags=flags)
+                        ocr_engine="tesseract", ocr_psm=int(cfg.get("psm", "6")),
+                        ocr_zoom=float(cfg["zoom"]), ocr_attempts=idx, flags=flags)
         if not cand["flags"]:
             return cand
         score = cand["avg_conf"] + min(len(cand["text_norm"]), 200) * 0.2
         if not best or score > best.get("_score", -1):
-            cand["_score"] = score
-            best = cand
-    return best or dict(text="", text_norm="", avg_conf=0.0, ocr_engine="tesseract", ocr_psm=6, ocr_zoom=base_zoom, ocr_attempts=len(variants), flags=["empty"])
+            cand["_score"] = score; best = cand
+    return best or dict(text="", text_norm="", avg_conf=0.0, ocr_engine="tesseract", ocr_psm=6,
+                        ocr_zoom=base_zoom, ocr_attempts=len(variants), flags=["empty"])
 
-# ---------------- Extractors ----------------
+# ---------------- Extraction ----------------
 def extract_text_from_pdf(file_bytes, preset: str, user_words_path: Optional[str],
                           base_zoom: float, use_trocr: bool, timeout_sec: int, max_pages: int = 0):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -399,12 +345,10 @@ def extract_text_from_pdf(file_bytes, preset: str, user_words_path: Optional[str
     limit = min(total, max_pages) if max_pages and max_pages > 0 else total
     prog = st.progress(0, text=f"Extracting text 0/{limit} pages...")
     for i, page in enumerate(doc):
-        if i >= limit:
-            break
+        if i >= limit: break
         try:
             embedded = (page.get_text() or "").strip()
-            if embedded:
-                parts.append(embedded)
+            if embedded: parts.append(embedded)
             else:
                 cand = ocr_page_auto(page, preset, user_words_path, base_zoom, timeout_sec, use_trocr)
                 parts.append(cand["text"])
@@ -420,54 +364,37 @@ def extract_pages_with_metadata(file_bytes, document_name, preset: str, user_wor
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     total = len(doc)
     limit = min(total, max_pages) if max_pages and max_pages > 0 else total
-    rows = []
-    prog = st.progress(0, text=f"OCR & split 0/{limit}...")
+    rows = []; prog = st.progress(0, text=f"OCR & split 0/{limit}...")
     for i, page in enumerate(doc):
-        if i >= limit:
-            break
+        if i >= limit: break
         try:
             embedded = (page.get_text() or "").strip()
             if embedded:
-                text = embedded
-                text_norm = normalize_text(text)
-                avg_conf = 80.0
+                text = embedded; text_norm = normalize_text(text); avg_conf = 80.0
                 flags = make_flags(avg_conf, text_norm, preset)
                 meta = dict(ocr_engine="embedded", ocr_psm=None, ocr_zoom=None, ocr_attempts=1)
             else:
                 cand = ocr_page_auto(page, preset, user_words_path, base_zoom, timeout_sec, use_trocr)
                 text, text_norm, avg_conf, flags = cand["text"], cand["text_norm"], cand["avg_conf"], cand["flags"]
-                meta = dict(ocr_engine=cand["ocr_engine"], ocr_psm=cand["ocr_psm"], ocr_zoom=cand["ocr_zoom"], ocr_attempts=cand["ocr_attempts"])
+                meta = dict(ocr_engine=cand["ocr_engine"], ocr_psm=cand["ocr_psm"],
+                            ocr_zoom=cand["ocr_zoom"], ocr_attempts=cand["ocr_attempts"])
             m = qc_metrics(text_norm)
             rows.append({
-                "document_name": document_name,
-                "page_number": i + 1,
-                "text": text,
-                "text_norm": text_norm,
-                "avg_conf": float(avg_conf),
-                "text_len": int(m["text_len"]),
+                "document_name": document_name, "page_number": i + 1,
+                "text": text, "text_norm": text_norm,
+                "avg_conf": float(avg_conf), "text_len": int(m["text_len"]),
                 "non_alnum_ratio": float(m["non_alnum_ratio"]),
-                "ocr_engine": meta["ocr_engine"],
-                "ocr_psm": meta["ocr_psm"],
-                "ocr_zoom": meta["ocr_zoom"],
-                "ocr_attempts": meta["ocr_attempts"],
-                "ocr_flags": flags,
-                "lang_preset": preset,
+                "ocr_engine": meta["ocr_engine"], "ocr_psm": meta["ocr_psm"],
+                "ocr_zoom": meta["ocr_zoom"], "ocr_attempts": meta["ocr_attempts"],
+                "ocr_flags": flags, "lang_preset": preset,
             })
         except Exception as e:
             rows.append({
-                "document_name": document_name,
-                "page_number": i + 1,
-                "text": f"[Error: {e}]",
-                "text_norm": "",
-                "avg_conf": 0.0,
-                "text_len": 0,
-                "non_alnum_ratio": 1.0,
-                "ocr_engine": "error",
-                "ocr_psm": None,
-                "ocr_zoom": None,
-                "ocr_attempts": 1,
-                "ocr_flags": ["error"],
-                "lang_preset": preset,
+                "document_name": document_name, "page_number": i + 1,
+                "text": f"[Error: {e}]", "text_norm": "",
+                "avg_conf": 0.0, "text_len": 0, "non_alnum_ratio": 1.0,
+                "ocr_engine": "error", "ocr_psm": None, "ocr_zoom": None, "ocr_attempts": 1,
+                "ocr_flags": ["error"], "lang_preset": preset,
             })
         finally:
             prog.progress((i + 1) / limit, text=f"OCR & split {i+1}/{limit}...")
@@ -483,16 +410,13 @@ def embed_texts(model, texts):
 
 # ---------------- Local search helpers ----------------
 def local_fuzzy_search(rows: List[Dict[str, Any]], query: str, top_k: int = 50) -> List[Dict[str, Any]]:
-    qn = normalize_text(query)
-    if not qn:
-        return []
-    results = []
-    use_rf = partial_ratio is not None
+    qn = normalize_text(query); 
+    if not qn: return []
+    results = []; use_rf = partial_ratio is not None
     tokens = [t for t in qn.split() if len(t) >= 3]
     for r in rows:
         tn = normalize_text(r.get("text", ""))
-        if tokens and not any(t in tn for t in tokens):
-            continue
+        if tokens and not any(t in tn for t in tokens): continue
         score = partial_ratio(qn, tn) if use_rf else (100 if qn in tn else 0)
         results.append({**r, "sim": float(score) / 100.0})
     results.sort(key=lambda x: (-x.get("sim", 0.0), x.get("document_name", ""), x.get("page_number") or 0))
@@ -500,67 +424,24 @@ def local_fuzzy_search(rows: List[Dict[str, Any]], query: str, top_k: int = 50) 
 
 def local_semantic_search(rows: List[Dict[str, Any]], query_vec: np.ndarray, top_k: int = 50) -> List[Dict[str, Any]]:
     embs = [np.array(r["embedding"], dtype=np.float32) for r in rows if isinstance(r.get("embedding"), list)]
-    if not embs:
-        return []
+    if not embs: return []
     M = np.vstack(embs); M /= (np.linalg.norm(M, axis=1, keepdims=True) + 1e-12)
     q = query_vec.astype(np.float32); q /= (np.linalg.norm(q) + 1e-12)
-    sims = M @ q
-    idxs = np.argsort(-sims)[:top_k]
+    sims = M @ q; idxs = np.argsort(-sims)[:top_k]
     kept, j = [], 0
     for r in rows:
-        if not isinstance(r.get("embedding"), list):
-            continue
+        if not isinstance(r.get("embedding"), list): continue
         if j in idxs:
             kept.append({k: r[k] for k in ("document_name", "page_number", "text") if k in r} | {"sim": float(sims[j])})
         j += 1
     kept.sort(key=lambda x: (-x.get("sim", 0.0), x.get("document_name", ""), x.get("page_number") or 0))
     return kept
 
-# ========================= Quick Actions =========================
-# We "jump" to a tab by reordering tabs so the chosen one appears first (Streamlit selects first by default).
-if "active_tab" not in st.session_state:
-    st.session_state["active_tab"] = "Ingest"  # default
+# ========================= Tabs (single sticky bar) =========================
+tab_ingest, tab_search, tab_qa = st.tabs(["📥 Ingest", "🔎 Search", "✅ QA"])
 
-st.markdown(
-    """
-<div class="qbar">
-  <span class="qbtn qbtn--primary">📥 Upload & OCR</span>
-  <span class="qbtn">🔎 Search</span>
-  <span class="qbtn">✅ QA</span>
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-# Use real buttons (above is purely cosmetic header). Buttons below drive state.
-col_q1, col_q2, col_q3 = st.columns([1,1,1])
-with col_q1:
-    if st.button("📥 Ingest", use_container_width=True):
-        st.session_state["active_tab"] = "Ingest"
-        st.rerun()
-with col_q2:
-    if st.button("🔎 Search", use_container_width=True):
-        st.session_state["active_tab"] = "Search"
-        st.rerun()
-with col_q3:
-    if st.button("✅ QA", use_container_width=True):
-        st.session_state["active_tab"] = "QA"
-        st.rerun()
-
-# Determine tab order
-ALL_TABS = ["📥 Ingest", "🔎 Search", "✅ QA"]
-LABEL_TO_KEY = {"📥 Ingest": "Ingest", "🔎 Search": "Search", "✅ QA": "QA"}
-active = st.session_state.get("active_tab", "Ingest")
-def order_tabs(active_key: str) -> List[str]:
-    lab_by_key = {v: k for k, v in LABEL_TO_KEY.items()}
-    first = lab_by_key.get(active_key, "📥 Ingest")
-    rest = [l for l in ALL_TABS if l != first]
-    return [first] + rest
-
-TAB_ORDER = order_tabs(active)
-
-# ---------------- Tab renderers (functions) ----------------
-def render_tab_ingest():
+# -------- Ingest tab --------
+with tab_ingest:
     st.subheader("Upload & Extract")
     uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", key="pdf_uploader")
 
@@ -614,19 +495,11 @@ def render_tab_ingest():
                 rows = []
                 for p, vec in zip(pages, emb):
                     rows.append({
-                        "document_name": p["document_name"],
-                        "page_number": p["page_number"],
-                        "text": p["text"],
-                        "text_norm": p["text_norm"],
-                        "avg_conf": p["avg_conf"],
-                        "text_len": p["text_len"],
-                        "non_alnum_ratio": p["non_alnum_ratio"],
-                        "ocr_engine": p["ocr_engine"],
-                        "ocr_psm": p["ocr_psm"],
-                        "ocr_zoom": p["ocr_zoom"],
-                        "ocr_attempts": p["ocr_attempts"],
-                        "ocr_flags": p["ocr_flags"],
-                        "lang_preset": p["lang_preset"],
+                        "document_name": p["document_name"], "page_number": p["page_number"],
+                        "text": p["text"], "text_norm": p["text_norm"],
+                        "avg_conf": p["avg_conf"], "text_len": p["text_len"], "non_alnum_ratio": p["non_alnum_ratio"],
+                        "ocr_engine": p["ocr_engine"], "ocr_psm": p["ocr_psm"], "ocr_zoom": p["ocr_zoom"],
+                        "ocr_attempts": p["ocr_attempts"], "ocr_flags": p["ocr_flags"], "lang_preset": p["lang_preset"],
                         "embedding": vec.tolist(),
                     })
 
@@ -638,15 +511,13 @@ def render_tab_ingest():
                         st.warning(f"Delete failed: {e}")
 
                 st.info("Uploading to Supabase…")
-                BATCH = 100
-                inserted = 0
+                BATCH = 100; inserted = 0
                 for i in range(0, len(rows), BATCH):
                     batch = rows[i : i + BATCH]
                     res = _supa.table("document_chunks").insert(batch).execute()
                     if getattr(res, "data", None) is None:
                         st.error("Insert returned no data. Check RLS and table schema.")
-                        st.write(res)
-                        st.stop()
+                        st.write(res); st.stop()
                     inserted += len(res.data)
                     st.write(f"Inserted rows {i+1}–{i+len(batch)} (total {inserted})")
                     time.sleep(0.05)
@@ -656,61 +527,52 @@ def render_tab_ingest():
                 st.error("Embedding or upload failed.")
                 st.exception(e)
 
-def render_tab_search():
+# -------- Search tab --------
+with tab_search:
     st.subheader("Search (Keyword / Fuzzy / Semantic)")
     if not _supa:
         st.info("Configure Supabase first to enable search.")
-        return
+    else:
+        try:
+            docs = _supa.table("document_chunks").select("document_name").execute()
+            doc_names = sorted({r["document_name"] for r in (docs.data or []) if r.get("document_name")})
+        except Exception:
+            doc_names = []
 
-    try:
-        docs = _supa.table("document_chunks").select("document_name").execute()
-        doc_names = sorted({r["document_name"] for r in (docs.data or []) if r.get("document_name")})
-    except Exception:
-        doc_names = []
+        colf1, colf2, colf3 = st.columns([2,1,1])
+        with colf1:
+            query = st.text_input("Query (e.g., Gen. Transporting)")
+        with colf2:
+            selected_doc = st.selectbox("Filter by doc (optional)", ["All"] + doc_names)
+        with colf3:
+            only_low_quality = st.checkbox("Only low-quality pages", value=False)
 
-    colf1, colf2, colf3 = st.columns([2,1,1])
-    with colf1:
-        query = st.text_input("Query (e.g., Gen. Transporting)")
-    with colf2:
-        selected_doc = st.selectbox("Filter by doc (optional)", ["All"] + doc_names)
-    with colf3:
-        only_low_quality = st.checkbox("Only low-quality pages", value=False)
+        mode = st.radio("Type", ["Keyword (exact/normalized)", "Keyword (fuzzy)", "Semantic"], index=0, horizontal=True)
+        top_k = st.slider("Results to show", 5, 200, 50)
+        fetch_all = st.checkbox("Return all matches (only for exact/normalized)")
+        max_scan = st.number_input("Max rows for local fallback", 100, 20000, 5000, step=100)
 
-    mode = st.radio("Type", ["Keyword (exact/normalized)", "Keyword (fuzzy)", "Semantic"], index=0, horizontal=True)
-    top_k = st.slider("Results to show", 5, 200, 50)
-    fetch_all = st.checkbox("Return all matches (only for exact/normalized)")
-    max_scan = st.number_input("Max rows for local fallback", 100, 20000, 5000, step=100)
-
-    if st.button("Search", type="primary"):
-        if not query:
-            st.warning("Please enter a query.")
-        else:
+        if st.button("Search", type="primary"):
             try:
                 results: List[Dict[str, Any]] = []
                 base = _supa.table("document_chunks").select("document_name,page_number,text,avg_conf,text_len", count="exact")
-                if selected_doc != "All":
-                    base = base.eq("document_name", selected_doc)
-                if only_low_quality:
-                    base = base.or_("avg_conf.lt.65,text_len.lte.10")
+                if selected_doc != "All": base = base.eq("document_name", selected_doc)
+                if only_low_quality: base = base.or_("avg_conf.lt.65,text_len.lte.10")
 
                 if mode.startswith("Keyword (exact/normalized)"):
                     norm_query = normalize_text(query)
-                    oq = escape_for_or_filter(query)
-                    onq = escape_for_or_filter(norm_query)
+                    oq = escape_for_or_filter(query); onq = escape_for_or_filter(norm_query)
                     q = base.or_(f"text.ilike.%{oq}%,text_norm.ilike.%{onq}%")
                     if fetch_all:
                         page_size = 100
                         first = q.order("document_name").order("page_number").range(0, page_size - 1).execute()
                         total = getattr(first, "count", None)
-                        results = list(first.data or [])
-                        offset = page_size
+                        results = list(first.data or []); offset = page_size
                         while total is not None and offset < total:
                             chunk = q.order("document_name").order("page_number").range(offset, min(offset + page_size - 1, total - 1)).execute()
                             data = chunk.data or []
-                            if not data:
-                                break
-                            results.extend(data)
-                            offset += len(data)
+                            if not data: break
+                            results.extend(data); offset += len(data)
                     else:
                         res = q.order("document_name").order("page_number").limit(top_k).execute()
                         results = getattr(res, "data", []) or []
@@ -727,32 +589,22 @@ def render_tab_search():
                         results.sort(key=lambda r: (-r.get("sim", 0.0), r.get("document_name", ""), r.get("page_number") or 0))
                     except Exception:
                         rpc_ok = False
-
                     if not rpc_ok:
-                        fetched = []
-                        offset = 0
-                        page_size = 1000
+                        fetched = []; offset = 0; page_size = 1000
                         while offset < max_scan:
                             q = _supa.table("document_chunks").select("document_name,page_number,text")
-                            if selected_doc != "All":
-                                q = q.eq("document_name", selected_doc)
-                            if only_low_quality:
-                                q = q.or_("avg_conf.lt.65,text_len.lte.10")
+                            if selected_doc != "All": q = q.eq("document_name", selected_doc)
+                            if only_low_quality: q = q.or_("avg_conf.lt.65,text_len.lte.10")
                             q = q.order("document_name").order("page_number").range(offset, offset + page_size - 1)
-                            chunk = q.execute()
-                            data = chunk.data or []
-                            if not data:
-                                break
-                            fetched.extend(data)
-                            offset += len(data)
-                            if len(fetched) >= max_scan:
-                                break
+                            chunk = q.execute(); data = chunk.data or []
+                            if not data: break
+                            fetched.extend(data); offset += len(data)
+                            if len(fetched) >= max_scan: break
                         results = local_fuzzy_search(fetched, query, top_k=top_k)
 
                 else:
                     model = load_embedding_model()
-                    qv = model.encode([query])[0].astype(np.float32)
-                    qv /= (np.linalg.norm(qv) + 1e-12)
+                    qv = model.encode([query])[0].astype(np.float32); qv /= (np.linalg.norm(qv) + 1e-12)
                     rpc_ok = True
                     try:
                         if selected_doc == "All":
@@ -763,319 +615,247 @@ def render_tab_search():
                         results.sort(key=lambda r: (r.get("document_name", ""), r.get("page_number") or 0))
                     except Exception:
                         rpc_ok = False
-
                     if not rpc_ok:
-                        fetched = []
-                        offset = 0
-                        page_size = 500
+                        fetched = []; offset = 0; page_size = 500
                         while offset < max_scan:
                             q = _supa.table("document_chunks").select("document_name,page_number,text,embedding,avg_conf,text_len")
-                            if selected_doc != "All":
-                                q = q.eq("document_name", selected_doc)
-                            if only_low_quality:
-                                q = q.or_("avg_conf.lt.65,text_len.lte.10")
+                            if selected_doc != "All": q = q.eq("document_name", selected_doc)
+                            if only_low_quality: q = q.or_("avg_conf.lt.65,text_len.lte.10")
                             q = q.order("document_name").order("page_number").range(offset, offset + page_size - 1)
-                            chunk = q.execute()
-                            data = chunk.data or []
-                            if not data:
-                                break
+                            chunk = q.execute(); data = chunk.data or []
+                            if not data: break
                             fetched.extend([d for d in data if isinstance(d.get("embedding"), list)])
                             offset += len(data)
-                            if len(fetched) >= max_scan:
-                                break
+                            if len(fetched) >= max_scan: break
                         results = local_semantic_search(fetched, qv, top_k=top_k)
 
                 if not results:
                     st.info("No results found.")
                 else:
                     for i, r in enumerate(results, 1):
-                        doc = r.get("document_name", "Unknown")
-                        page = r.get("page_number", "?")
+                        doc = r.get("document_name", "Unknown"); page = r.get("page_number", "?")
                         text = (r.get("text") or "").replace("\n", " ")
                         snippet = text[:400] + ("..." if len(text) > 400 else "")
                         st.markdown(f"**{i}. {doc} — Page {page}**")
                         st.write(snippet or "_(empty page)_")
-                        if "sim" in r:
-                            st.caption(f"Similarity: {r['sim']:.3f}")
-                        if "avg_conf" in r and "text_len" in r:
-                            st.caption(f"conf={r['avg_conf']:.1f}, len={r['text_len']}")
+                        if "sim" in r: st.caption(f"Similarity: {r['sim']:.3f}")
+                        if "avg_conf" in r and "text_len" in r: st.caption(f"conf={r['avg_conf']:.1f}, len={r['text_len']}")
                         st.divider()
             except Exception as e:
                 st.error("Search failed.")
                 st.exception(e)
 
-def render_tab_qa():
+# -------- QA tab --------
+with tab_qa:
     st.subheader("Quality Assurance")
-
     if not _supa:
         st.info("Configure Supabase first.")
-        return
+    else:
+        st.info(
+            "Use QA to spot weak OCR pages across thousands of docs:\n"
+            "• **List flagged pages** below (by confidence/length).\n"
+            "• **Batch re-OCR** flagged pages for the last uploaded PDF.\n"
+            "• **Inspector** lets you fix a single page with better OCR settings."
+        )
 
-    st.info(
-        "How to use QA:\n"
-        "1) Choose a document (or **All**) and set **Min conf**.\n"
-        "2) Click **List flagged pages** → export CSV if needed.\n"
-        "3) Use **Batch re-OCR** to fix the **last uploaded PDF**.\n"
-        "4) For a single page, use **Inspector** to test variants and update."
-    )
-
-    # KPI row
-    try:
-        docs_res = _supa.table("document_chunks").select("document_name").execute()
-        all_docs = sorted({r["document_name"] for r in (docs_res.data or []) if r.get("document_name")})
-    except Exception:
-        all_docs = []
-
-    try:
-        total_pages = _supa.table("document_chunks").select("id", count="exact").limit(1).execute().count or 0
-        flagged_pages = _supa.table("document_chunks").select("id", count="exact").or_("avg_conf.lt.65,text_len.lte.10").limit(1).execute().count or 0
-    except Exception:
-        total_pages, flagged_pages = 0, 0
-
-    pass_rate = (100.0 * (max(total_pages - flagged_pages, 0) / total_pages)) if total_pages else 0.0
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown('<div class="kpi-card"><div class="kpi-title">Documents</div>'
-                    f'<div class="kpi-value">{len(all_docs)}</div></div>', unsafe_allow_html=True)
-    with c2:
-        st.markdown('<div class="kpi-card"><div class="kpi-title">Pages Indexed</div>'
-                    f'<div class="kpi-value">{total_pages}</div></div>', unsafe_allow_html=True)
-    with c3:
-        st.markdown('<div class="kpi-card"><div class="kpi-title">Flagged Pages</div>'
-                    f'<div class="kpi-value">{flagged_pages}</div></div>', unsafe_allow_html=True)
-    with c4:
-        badge_class = "badge--ok" if pass_rate >= 90 else ("badge--warn" if pass_rate >= 70 else "badge--err")
-        st.markdown('<div class="kpi-card"><div class="kpi-title">Pass Rate</div>'
-                    f'<div class="kpi-value">{pass_rate:.1f}%</div>'
-                    f'<span class="badge {badge_class}">quality</span></div>', unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # Controls for listing flagged
-    try:
-        _docs = _supa.table("document_chunks").select("document_name").execute()
-        qa_docs = sorted({r["document_name"] for r in (_docs.data or []) if r.get("document_name")})
-    except Exception:
-        qa_docs = []
-    colq1, colq2, colq3 = st.columns([2,1,1])
-    with colq1:
-        sel_doc = st.selectbox("Filter by doc (optional)", ["All"] + qa_docs, key="qa_doc")
-    with colq2:
-        min_conf = st.slider("Min conf", 0, 100, 65, key="qa_conf")
-    with colq3:
-        list_btn = st.button("List flagged pages", key="qa_list")
-
-    if list_btn:
+        # KPIs
         try:
-            q = _supa.table("document_chunks").select(
-                "document_name,page_number,avg_conf,text_len,non_alnum_ratio,ocr_engine,ocr_psm,ocr_zoom,ocr_attempts"
-            )
-            if sel_doc != "All":
-                q = q.eq("document_name", sel_doc)
-            q = q.or_(f"avg_conf.lt.{min_conf},text_len.lte.10")
-            q = q.order("document_name").order("page_number").limit(5000)
-            res = q.execute()
-            rows = res.data or []
-            if not rows:
-                st.success("No flagged pages 🎉")
-            else:
-                df = pd.DataFrame(rows)
-                st.dataframe(df, use_container_width=True)
-                csv = df.to_csv(index=False).encode("utf-8")
-                st.download_button("Download CSV", data=csv, file_name="ocr_flagged_pages.csv", mime="text/csv")
-
-                # Modern Altair chart: top flagged documents
-                try:
-                    chart_df = (
-                        df.groupby("document_name", as_index=False)
-                          .size()
-                          .rename(columns={"size": "flagged"})
-                          .sort_values("flagged", ascending=False)
-                          .head(15)
-                    )
-                    chart = (
-                        alt.Chart(chart_df)
-                           .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
-                           .encode(
-                                x=alt.X("flagged:Q", title="Flagged pages"),
-                                y=alt.Y("document_name:N", sort='-x', title="Document"),
-                                tooltip=["document_name:N","flagged:Q"]
-                            )
-                           .properties(height=380)
-                    )
-                    st.markdown("**Top flagged documents**")
-                    st.altair_chart(chart, use_container_width=True)
-                except Exception:
-                    pass
-        except Exception as e:
-            st.error("QA query failed.")
-            st.exception(e)
-
-    st.markdown("---")
-    st.subheader("Batch re-OCR flagged pages (last uploaded PDF)")
-    st.caption("Upload & Process the PDF in **Ingest** first so the app holds its bytes.")
-    if st.button("Re-OCR flagged pages now", key="qa_reocr"):
+            docs_res = _supa.table("document_chunks").select("document_name").execute()
+            all_docs = sorted({r["document_name"] for r in (docs_res.data or []) if r.get("document_name")})
+        except Exception:
+            all_docs = []
         try:
-            docname = st.session_state.get("last_pdf_name")
-            file_bytes = st.session_state.get("last_pdf_bytes")
-            if not docname or not file_bytes:
-                st.warning("No PDF in memory. Go to Ingest → Process PDF, then return.")
-            else:
-                q = (_supa.table("document_chunks")
-                     .select("id,page_number")
-                     .eq("document_name", docname)
-                     .or_("avg_conf.lt.65,text_len.lte.10")
-                     .order("page_number")
-                     .limit(5000))
-                flagged = q.execute().data or []
-                if not flagged:
-                    st.info("No flagged pages for this document.")
-                else:
-                    doc = fitz.open(stream=file_bytes, filetype="pdf")
-                    model = load_embedding_model()
-                    updated = 0
-                    prog = st.progress(0, text="Re-OCR 0 pages")
-                    for i, row in enumerate(flagged, 1):
-                        pno = row["page_number"]
-                        if 1 <= pno <= len(doc):
-                            page = doc[pno - 1]
-                            cand = ocr_page_auto(page, preset, user_words_path, base_zoom, timeout_sec, use_trocr, max_attempts=4)
-                            vec = model.encode([cand["text"]])[0].astype(np.float32)
-                            vec /= (np.linalg.norm(vec) + 1e-12)
-                            m = qc_metrics(cand["text_norm"])
-                            _supa.table("document_chunks").update({
-                                "text": cand["text"],
-                                "text_norm": cand["text_norm"],
-                                "avg_conf": float(cand["avg_conf"]),
-                                "text_len": int(m["text_len"]),
-                                "non_alnum_ratio": float(m["non_alnum_ratio"]),
-                                "ocr_engine": cand["ocr_engine"],
-                                "ocr_psm": cand["ocr_psm"],
-                                "ocr_zoom": cand["ocr_zoom"],
-                                "ocr_attempts": cand["ocr_attempts"],
-                                "embedding": vec.tolist(),
-                            }).eq("id", row["id"]).execute()
-                            updated += 1
-                        prog.progress(i/len(flagged), text=f"Re-OCR {i}/{len(flagged)} pages")
-                    doc.close()
-                    st.success(f"Re-OCR complete. Updated {updated} pages.")
-        except Exception as e:
-            st.error("Batch re-OCR failed.")
-            st.exception(e)
+            total_pages = _supa.table("document_chunks").select("id", count="exact").limit(1).execute().count or 0
+            flagged_pages = _supa.table("document_chunks").select("id", count="exact").or_("avg_conf.lt.65,text_len.lte.10").limit(1).execute().count or 0
+        except Exception:
+            total_pages, flagged_pages = 0, 0
 
-    st.markdown("---")
-    st.subheader("Single-page Inspector (manual override)")
-    try:
-        _docs2 = _supa.table("document_chunks").select("document_name").execute()
-        insp_docs = sorted({r["document_name"] for r in (_docs2.data or []) if r.get("document_name")})
-    except Exception:
-        insp_docs = []
-    colI1, colI2, colI3 = st.columns([2,1,1])
-    with colI1:
-        doc_to_fix = st.selectbox("Document", insp_docs, key="ins_doc")
-    with colI2:
-        page_to_fix = st.number_input("Page #", min_value=1, value=3, step=1, key="ins_page")
-    with colI3:
-        keyword_test = st.text_input("Keyword (optional)", value="Gen. Transporting", key="ins_kw")
+        pass_rate = (100.0 * (max(total_pages - flagged_pages, 0) / total_pages)) if total_pages else 0.0
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: st.markdown(f'<div class="card"><div class="kpi-title">Documents</div><div class="kpi-value">{len(all_docs)}</div></div>', unsafe_allow_html=True)
+        with c2: st.markdown(f'<div class="card"><div class="kpi-title">Pages Indexed</div><div class="kpi-value">{total_pages}</div></div>', unsafe_allow_html=True)
+        with c3: st.markdown(f'<div class="card"><div class="kpi-title">Flagged Pages</div><div class="kpi-value">{flagged_pages}</div></div>', unsafe_allow_html=True)
+        with c4:
+            badge = "badge--ok" if pass_rate >= 90 else ("badge--warn" if pass_rate >= 70 else "badge--err")
+            st.markdown(f'<div class="card"><div class="kpi-title">Pass Rate</div><div class="kpi-value">{pass_rate:.1f}%</div><span class="badge {badge}">quality</span></div>', unsafe_allow_html=True)
 
-    cA, cB = st.columns(2)
-    with cA:
-        if st.button("Fetch row", key="btn_fetch_row"):
+        st.markdown("---")
+
+        # Flagged list controls
+        try:
+            _docs = _supa.table("document_chunks").select("document_name").execute()
+            qa_docs = sorted({r["document_name"] for r in (_docs.data or []) if r.get("document_name")})
+        except Exception:
+            qa_docs = []
+        colq1, colq2, colq3 = st.columns([2,1,1])
+        with colq1:
+            sel_doc = st.selectbox("Filter by doc (optional)", ["All"] + qa_docs, key="qa_doc")
+        with colq2:
+            min_conf = st.slider("Min conf", 0, 100, 65, key="qa_conf")
+        with colq3:
+            list_btn = st.button("List flagged pages", key="qa_list")
+
+        if list_btn:
             try:
-                r = (_supa.table("document_chunks")
-                     .select("id,document_name,page_number,text,avg_conf,text_len")
-                     .eq("document_name", doc_to_fix)
-                     .eq("page_number", page_to_fix)
-                     .limit(1).execute())
-                row = (r.data or [None])[0]
-                if not row:
-                    st.error("No row found.")
+                q = _supa.table("document_chunks").select(
+                    "document_name,page_number,avg_conf,text_len,non_alnum_ratio,ocr_engine,ocr_psm,ocr_zoom,ocr_attempts"
+                )
+                if sel_doc != "All": q = q.eq("document_name", sel_doc)
+                q = q.or_(f"avg_conf.lt.{min_conf},text_len.lte.10").order("document_name").order("page_number").limit(5000)
+                res = q.execute(); rows = res.data or []
+                if not rows:
+                    st.success("No flagged pages 🎉")
                 else:
-                    st.session_state["_inspect_row"] = row
-                    raw = row.get("text") or ""
-                    norm = normalize_text(raw)
-                    st.success(f"Row loaded. conf={row.get('avg_conf')}, len={row.get('text_len')}")
-                    st.write((raw[:900] + ("..." if len(raw) > 900 else "")) or "_(empty)_")
-                    if keyword_test:
-                        qn = normalize_text(keyword_test)
-                        st.caption(f"Contains(raw)={keyword_test.lower() in raw.lower()} | Contains(norm)={qn in norm}")
+                    df = pd.DataFrame(rows); st.dataframe(df, use_container_width=True)
+                    csv = df.to_csv(index=False).encode("utf-8")
+                    st.download_button("Download CSV", data=csv, file_name="ocr_flagged_pages.csv", mime="text/csv")
+                    # Chart
+                    try:
+                        chart_df = (df.groupby("document_name", as_index=False).size()
+                                      .rename(columns={"size": "flagged"})
+                                      .sort_values("flagged", ascending=False).head(15))
+                        chart = (alt.Chart(chart_df)
+                                   .mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6)
+                                   .encode(x=alt.X("flagged:Q", title="Flagged pages"),
+                                           y=alt.Y("document_name:N", sort='-x', title="Document"),
+                                           tooltip=["document_name:N","flagged:Q"])
+                                   .properties(height=380))
+                        st.markdown("**Top flagged documents**")
+                        st.altair_chart(chart, use_container_width=True)
+                    except Exception:
+                        pass
             except Exception as e:
-                st.error("Fetch failed.")
-                st.exception(e)
+                st.error("QA query failed."); st.exception(e)
 
-    with cB:
-        if st.button("Try re-OCR variants", key="btn_reocr"):
-            ok = (st.session_state.get("last_pdf_bytes") is not None and st.session_state.get("last_pdf_name") == doc_to_fix)
-            if not ok:
-                st.warning("Upload & Process the same PDF in Ingest first (so its bytes are in memory).")
-            else:
-                try:
-                    pdf_bytes = st.session_state["last_pdf_bytes"]
-                    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-                    if page_to_fix < 1 or page_to_fix > len(doc):
-                        st.error(f"PDF has {len(doc)} pages — page {page_to_fix} out of range.")
+        st.markdown("---")
+        st.subheader("Batch re-OCR flagged pages (last uploaded PDF)")
+        st.caption("Upload & Process the PDF in **Ingest** first so the app holds its bytes.")
+        if st.button("Re-OCR flagged pages now", key="qa_reocr"):
+            try:
+                docname = st.session_state.get("last_pdf_name")
+                file_bytes = st.session_state.get("last_pdf_bytes")
+                if not docname or not file_bytes:
+                    st.warning("No PDF in memory. Go to Ingest → Process PDF, then return.")
+                else:
+                    q = (_supa.table("document_chunks")
+                         .select("id,page_number")
+                         .eq("document_name", docname)
+                         .or_("avg_conf.lt.65,text_len.lte.10")
+                         .order("page_number")
+                         .limit(5000))
+                    flagged = q.execute().data or []
+                    if not flagged:
+                        st.info("No flagged pages for this document.")
                     else:
-                        page = doc[page_to_fix - 1]
-                        variants = [("eng", "6", 3.0), ("eng", "7", 3.5), ("eng", "11", 3.5), ("eng", "4", 4.0)]
-                        tried = []
-                        for lang, psm, zoom in variants:
-                            txt, conf = tesseract_ocr(page, zoom=float(zoom), lang=lang, psm=psm,
-                                                      user_words_path=user_words_path, timeout_sec=25)
-                            tried.append({"lang": lang, "psm": psm, "zoom": zoom, "conf": conf,
-                                          "text": txt, "text_norm": normalize_text(txt), "len": len(normalize_text(txt))})
+                        doc = fitz.open(stream=file_bytes, filetype="pdf")
+                        model = load_embedding_model()
+                        updated = 0
+                        prog = st.progress(0, text="Re-OCR 0 pages")
+                        for i, row in enumerate(flagged, 1):
+                            pno = row["page_number"]
+                            if 1 <= pno <= len(doc):
+                                page = doc[pno - 1]
+                                cand = ocr_page_auto(page, preset, user_words_path, base_zoom, timeout_sec, use_trocr, max_attempts=4)
+                                vec = model.encode([cand["text"]])[0].astype(np.float32); vec /= (np.linalg.norm(vec) + 1e-12)
+                                m = qc_metrics(cand["text_norm"])
+                                _supa.table("document_chunks").update({
+                                    "text": cand["text"], "text_norm": cand["text_norm"],
+                                    "avg_conf": float(cand["avg_conf"]), "text_len": int(m["text_len"]),
+                                    "non_alnum_ratio": float(m["non_alnum_ratio"]),
+                                    "ocr_engine": cand["ocr_engine"], "ocr_psm": cand["ocr_psm"],
+                                    "ocr_zoom": cand["ocr_zoom"], "ocr_attempts": cand["ocr_attempts"],
+                                    "embedding": vec.tolist(),
+                                }).eq("id", row["id"]).execute()
+                                updated += 1
+                            prog.progress(i/len(flagged), text=f"Re-OCR {i}/{len(flagged)} pages")
                         doc.close()
-                        tried.sort(key=lambda d: (-d["len"], -d["conf"]))
-                        for i, cand in enumerate(tried[:3], 1):
-                            st.markdown(f"**#{i} lang={cand['lang']} psm={cand['psm']} zoom={cand['zoom']} (conf={cand['conf']:.1f}, len={cand['len']})**")
-                            st.write(cand["text_norm"][:600] + ("..." if len(cand["text_norm"]) > 600 else ""))
-                        st.session_state["_re_ocr_candidates"] = tried
-                except Exception as e:
-                    st.error("Re-OCR failed.")
-                    st.exception(e)
-
-    row = st.session_state.get("_inspect_row")
-    cands = st.session_state.get("_re_ocr_candidates", [])
-    if row and cands:
-        labels = [f"#{i+1}: {d['lang']} psm={d['psm']} zoom={d['zoom']} (conf={d['conf']:.1f}, len={d['len']})" for i, d in enumerate(cands[:5])]
-        pick = st.selectbox("Pick candidate to save", labels, key="pick_cand")
-        idx = labels.index(pick); chosen = cands[idx]
-        if st.button("✅ Update this page", key="btn_update_page"):
-            try:
-                model = load_embedding_model()
-                vec = model.encode([chosen["text"]])[0].astype(np.float32)
-                vec /= (np.linalg.norm(vec) + 1e-12)
-                m = qc_metrics(chosen["text_norm"])
-                _supa.table("document_chunks").update({
-                    "text": chosen["text"],
-                    "text_norm": chosen["text_norm"],
-                    "avg_conf": float(chosen["conf"]),
-                    "text_len": int(m["text_len"]),
-                    "non_alnum_ratio": float(m["non_alnum_ratio"]),
-                    "ocr_engine": "tesseract",
-                    "ocr_psm": int(chosen["psm"]),
-                    "ocr_zoom": float(chosen["zoom"]),
-                    "ocr_attempts": 1,
-                    "embedding": vec.tolist(),
-                }).eq("id", row["id"]).execute()
-                st.success("Updated. Re-run search if needed.")
+                        st.success(f"Re-OCR complete. Updated {updated} pages.")
             except Exception as e:
-                st.error("Update failed.")
-                st.exception(e)
+                st.error("Batch re-OCR failed."); st.exception(e)
 
-# ========================= Tabs (dynamic order) =========================
-tabs = st.tabs(TAB_ORDER)
-tab_containers = dict(zip(TAB_ORDER, tabs))
+        st.markdown("---")
+        st.subheader("Single-page Inspector (manual override)")
+        try:
+            _docs2 = _supa.table("document_chunks").select("document_name").execute()
+            insp_docs = sorted({r["document_name"] for r in (_docs2.data or []) if r.get("document_name")})
+        except Exception:
+            insp_docs = []
+        colI1, colI2, colI3 = st.columns([2,1,1])
+        with colI1: doc_to_fix = st.selectbox("Document", insp_docs, key="ins_doc")
+        with colI2: page_to_fix = st.number_input("Page #", min_value=1, value=3, step=1, key="ins_page")
+        with colI3: keyword_test = st.text_input("Keyword (optional)", value="Gen. Transporting", key="ins_kw")
 
-# Map labels to renderers
-def label_to_renderer(label: str):
-    if label == "📥 Ingest": return render_tab_ingest
-    if label == "🔎 Search": return render_tab_search
-    return render_tab_qa  # "✅ QA"
+        cA, cB = st.columns(2)
+        with cA:
+            if st.button("Fetch row", key="btn_fetch_row"):
+                try:
+                    r = (_supa.table("document_chunks")
+                         .select("id,document_name,page_number,text,avg_conf,text_len")
+                         .eq("document_name", doc_to_fix)
+                         .eq("page_number", page_to_fix)
+                         .limit(1).execute())
+                    row = (r.data or [None])[0]
+                    if not row: st.error("No row found.")
+                    else:
+                        st.session_state["_inspect_row"] = row
+                        raw = row.get("text") or ""; norm = normalize_text(raw)
+                        st.success(f"Row loaded. conf={row.get('avg_conf')}, len={row.get('text_len')}")
+                        st.write((raw[:900] + ("..." if len(raw) > 900 else "")) or "_(empty)_")
+                        if keyword_test:
+                            qn = normalize_text(keyword_test)
+                            st.caption(f"Contains(raw)={keyword_test.lower() in raw.lower()} | Contains(norm)={qn in norm}")
+                except Exception as e:
+                    st.error("Fetch failed."); st.exception(e)
 
-for lab, container in tab_containers.items():
-    with container:
-        label_to_renderer(lab)()
+        with cB:
+            if st.button("Try re-OCR variants", key="btn_reocr"):
+                ok = (st.session_state.get("last_pdf_bytes") is not None and st.session_state.get("last_pdf_name") == doc_to_fix)
+                if not ok:
+                    st.warning("Upload & Process the same PDF in Ingest first (so bytes are in memory).")
+                else:
+                    try:
+                        pdf_bytes = st.session_state["last_pdf_bytes"]
+                        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                        if page_to_fix < 1 or page_to_fix > len(doc):
+                            st.error(f"PDF has {len(doc)} pages — {page_to_fix} out of range.")
+                        else:
+                            page = doc[page_to_fix - 1]
+                            variants = [("eng", "6", 3.0), ("eng", "7", 3.5), ("eng", "11", 3.5), ("eng", "4", 4.0)]
+                            tried = []
+                            for lang, psm, zoom in variants:
+                                txt, conf = tesseract_ocr(page, float(zoom), lang, psm, user_words_path, 25)
+                                tried.append({"lang": lang, "psm": psm, "zoom": zoom, "conf": conf,
+                                              "text": txt, "text_norm": normalize_text(txt), "len": len(normalize_text(txt))})
+                            doc.close()
+                            tried.sort(key=lambda d: (-d["len"], -d["conf"]))
+                            for i, cand in enumerate(tried[:3], 1):
+                                st.markdown(f"**#{i} lang={cand['lang']} psm={cand['psm']} zoom={cand['zoom']} "
+                                            f"(conf={cand['conf']:.1f}, len={cand['len']})**")
+                                st.write(cand["text_norm"][:600] + ("..." if len(cand["text_norm"]) > 600 else ""))
+                            st.session_state["_re_ocr_candidates"] = tried
+                    except Exception as e:
+                        st.error("Re-OCR failed."); st.exception(e)
+
+        row = st.session_state.get("_inspect_row"); cands = st.session_state.get("_re_ocr_candidates", [])
+        if row and cands:
+            labels = [f"#{i+1}: {d['lang']} psm={d['psm']} zoom={d['zoom']} (conf={d['conf']:.1f}, len={d['len']})" for i, d in enumerate(cands[:5])]
+            pick = st.selectbox("Pick candidate to save", labels, key="pick_cand")
+            idx = labels.index(pick); chosen = cands[idx]
+            if st.button("✅ Update this page", key="btn_update_page"):
+                try:
+                    model = load_embedding_model()
+                    vec = model.encode([chosen["text"]])[0].astype(np.float32); vec /= (np.linalg.norm(vec) + 1e-12)
+                    m = qc_metrics(chosen["text_norm"])
+                    _supa.table("document_chunks").update({
+                        "text": chosen["text"], "text_norm": chosen["text_norm"],
+                        "avg_conf": float(chosen["conf"]), "text_len": int(m["text_len"]),
+                        "non_alnum_ratio": float(m["non_alnum_ratio"]),
+                        "ocr_engine": "tesseract", "ocr_psm": int(chosen["psm"]), "ocr_zoom": float(chosen["zoom"]),
+                        "ocr_attempts": 1, "embedding": vec.tolist(),
+                    }).eq("id", row["id"]).execute()
+                    st.success("Updated. Re-run search if needed.")
+                except Exception as e:
+                    st.error("Update failed."); st.exception(e)
 
 # ---------------- Sticky footer ----------------
 st.markdown(
