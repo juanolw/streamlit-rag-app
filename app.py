@@ -63,3 +63,39 @@ if uploaded_file:
                 st.exception(e)
 else:
     st.caption("Tip: start with a small PDF (1–10 pages). Very large scanned PDFs can be slow on free tiers.")
+
+# NEW: page-level extractor that returns one record per page
+def extract_pages_with_metadata(file_bytes: bytes, document_name: str):
+    """
+    Returns a list of dicts: [{document_name, page_number, text}, ...]
+    - Uses embedded text when available
+    - Falls back to OCR per page if needed
+    """
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+    except Exception as e:
+        raise RuntimeError(f"Could not open PDF: {e}")
+
+    pages = []
+    total_pages = len(doc)
+    progress = st.progress(0, text=f"Splitting into pages 0/{total_pages}...")
+
+    for i, page in enumerate(doc):
+        # Try embedded text first
+        text = (page.get_text() or "").strip()
+        if not text:
+            # Fallback to OCR for this page only
+            pix = page.get_pixmap()
+            png_bytes = pix.tobytes("png")
+            img = Image.open(io.BytesIO(png_bytes))
+            text = (pytesseract.image_to_string(img) or "").strip()
+
+        pages.append({
+            "document_name": document_name,
+            "page_number": i + 1,  # 1-based
+            "text": text
+        })
+        progress.progress((i + 1) / total_pages, text=f"Splitting into pages {i+1}/{total_pages}...")
+
+    doc.close()
+    return pages
