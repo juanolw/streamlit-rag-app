@@ -5,7 +5,6 @@ import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
 
-
 # --- DEBUG: Supabase connection test ---
 from supabase import create_client
 
@@ -17,10 +16,6 @@ if "SUPABASE_URL" in st.secrets and "SUPABASE_ANON_KEY" in st.secrets:
         st.sidebar.success(f"✅ Supabase connected. Table rows: {res.count}")
     except Exception as e:
         st.sidebar.error(f"❌ Supabase connection failed: {e}")
-
-
-
-
 
 st.set_page_config(page_title="PDF Text Extractor (RAG - Part 1 & 2.1)", layout="wide")
 st.title("PDF Text Extractor")
