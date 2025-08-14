@@ -5,6 +5,9 @@ import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
 
+import supabase as _sb
+st.sidebar.caption(f"supabase-py version: {_sb.__version__}")
+
 # --- DEBUG: Supabase connection test ---
 from supabase import create_client, Client
 from supabase.client import ClientOptions
