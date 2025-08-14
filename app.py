@@ -1,75 +1,58 @@
+# app.py
 import io
 import streamlit as st
 import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
 
-st.set_page_config(page_title="PDF Text Extractor (RAG App Part 1)", layout="wide")
-st.title("PDF Text Extractor (RAG App Part 1)")
-st.write("Upload a PDF file and click **Process PDF** to extract its text. If a page has no embedded text, the app falls back to OCR.")
+st.set_page_config(page_title="PDF Text Extractor (RAG - Part 1 & 2.1)", layout="wide")
+st.title("PDF Text Extractor")
+st.caption("Uploads a PDF, extracts text (with OCR fallback), and builds page-level chunks with document and page metadata.")
 
-uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+# ---------- Helpers ----------
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extract text from PDF bytes. Uses embedded text when available, otherwise OCR on rendered page images."""
+    """
+    Whole-document text extraction.
+    Uses embedded text where available; falls back to OCR per page if needed.
+    Returns one big string (for quick viewing).
+    """
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
     except Exception as e:
         raise RuntimeError(f"Could not open PDF: {e}")
 
-    full_text = []
+    full_text_parts = []
     total_pages = len(doc)
-
-    # Progress bar
-    progress = st.progress(0, text=f"Processing 0/{total_pages} pages...")
+    progress = st.progress(0, text=f"Extracting text 0/{total_pages} pages...")
 
     for i, page in enumerate(doc):
         try:
             text = (page.get_text() or "").strip()
             if text:
-                full_text.append(text)
+                full_text_parts.append(text)
             else:
-                # Render page to image for OCR
-                pix = page.get_pixmap()  # rasterize page
-                # Convert pixmap -> PNG bytes -> PIL.Image
+                # OCR fallback for this page
+                pix = page.get_pixmap()
                 png_bytes = pix.tobytes("png")
                 img = Image.open(io.BytesIO(png_bytes))
-                ocr_text = pytesseract.image_to_string(img)
-                full_text.append(ocr_text.strip())
+                ocr_text = (pytesseract.image_to_string(img) or "").strip()
+                full_text_parts.append(ocr_text)
         except Exception as page_err:
-            # Don't break the whole run on one bad page – record the error and continue
-            full_text.append(f"[Error reading page {i+1}: {page_err}]")
+            full_text_parts.append(f"[Error reading page {i+1}: {page_err}]")
         finally:
-            progress.progress((i + 1) / total_pages, text=f"Processing {i+1}/{total_pages} pages...")
+            progress.progress((i + 1) / total_pages, text=f"Extracting text {i+1}/{total_pages} pages...")
 
     doc.close()
-    return "\n\n--- PAGE BREAK ---\n\n".join(full_text).strip()
+    return "\n\n--- PAGE BREAK ---\n\n".join(full_text_parts).strip()
 
-if uploaded_file:
-    st.info(f"**Selected file:** {uploaded_file.name}  •  Size: {uploaded_file.size/1024:.1f} KB")
-    if st.button("Process PDF", type="primary"):
-        with st.spinner("Extracting text..."):
-            try:
-                file_bytes = uploaded_file.read()
-                extracted = extract_text_from_pdf(file_bytes)
-                if extracted:
-                    st.subheader("Extracted Text")
-                    st.text_area("PDF Text Content", extracted, height=400)
-                    st.success("Done! You can upload another file or proceed to the next steps later.")
-                else:
-                    st.warning("No text found. If this is a scanned PDF, OCR may have struggled to read it.")
-            except Exception as e:
-                st.error("Something went wrong while processing the PDF.")
-                st.exception(e)
-else:
-    st.caption("Tip: start with a small PDF (1–10 pages). Very large scanned PDFs can be slow on free tiers.")
 
-# NEW: page-level extractor that returns one record per page
 def extract_pages_with_metadata(file_bytes: bytes, document_name: str):
     """
-    Returns a list of dicts: [{document_name, page_number, text}, ...]
-    - Uses embedded text when available
-    - Falls back to OCR per page if needed
+    Page-level chunking for RAG (Step 2.1).
+    Returns a list of dicts like:
+      {"document_name": <str>, "page_number": <int>, "text": <str>}
+    Uses embedded text where available; OCR fallback per page otherwise.
     """
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -78,13 +61,12 @@ def extract_pages_with_metadata(file_bytes: bytes, document_name: str):
 
     pages = []
     total_pages = len(doc)
-    progress = st.progress(0, text=f"Splitting into pages 0/{total_pages}...")
+    progress = st.progress(0, text=f"Splitting into page chunks 0/{total_pages}...")
 
     for i, page in enumerate(doc):
-        # Try embedded text first
         text = (page.get_text() or "").strip()
         if not text:
-            # Fallback to OCR for this page only
+            # OCR fallback only for pages without embedded text
             pix = page.get_pixmap()
             png_bytes = pix.tobytes("png")
             img = Image.open(io.BytesIO(png_bytes))
@@ -92,10 +74,58 @@ def extract_pages_with_metadata(file_bytes: bytes, document_name: str):
 
         pages.append({
             "document_name": document_name,
-            "page_number": i + 1,  # 1-based
+            "page_number": i + 1,  # 1-based page numbering
             "text": text
         })
-        progress.progress((i + 1) / total_pages, text=f"Splitting into pages {i+1}/{total_pages}...")
+        progress.progress((i + 1) / total_pages, text=f"Splitting into page chunks {i+1}/{total_pages}...")
 
     doc.close()
     return pages
+
+# ---------- UI ----------
+
+uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+
+if uploaded_file:
+    st.info(f"**Selected file:** {uploaded_file.name}  •  Size: {uploaded_file.size/1024:.1f} KB")
+
+    if st.button("Process PDF", type="primary", use_container_width=True):
+        with st.spinner("Processing..."):
+            try:
+                # Read once and reuse for both functions
+                file_bytes = uploaded_file.read()
+
+                # 1) Whole-document extraction for quick viewing (Part 1)
+                extracted_text = extract_text_from_pdf(file_bytes)
+
+                # 2) NEW: Page-level chunks with metadata (Part 2 - Step 1)
+                page_chunks = extract_pages_with_metadata(file_bytes, uploaded_file.name)
+
+                # Save to session for later steps (embeddings/search)
+                st.session_state["pages"] = page_chunks
+                st.session_state["document_name"] = uploaded_file.name
+
+                # ---- Output: Preview ----
+                st.success("Done! See previews below. Page-level chunks are ready for embeddings/search in the next step.")
+
+                # A) Quick per-page preview (first 5 pages)
+                st.subheader("Per‑page chunks (preview)")
+                if not page_chunks:
+                    st.warning("No page text was extracted (OCR may have struggled).")
+                else:
+                    for rec in page_chunks[:5]:
+                        st.markdown(f"**{rec['document_name']} — Page {rec['page_number']}**")
+                        preview = (rec["text"] or "").replace("\n", " ")
+                        st.write((preview[:500] + ("..." if len(preview) > 500 else "")) or "_(empty page)_")
+                        st.divider()
+
+                # B) Whole-document text preview (scrollable)
+                st.subheader("Full Extracted Text")
+                st.text_area("PDF Text Content", extracted_text or "", height=300)
+
+            except Exception as e:
+                st.error("Something went wrong while processing the PDF.")
+                st.exception(e)
+
+else:
+    st.caption("Tip: start with a small PDF (1–10 pages). Very large scanned PDFs can be slow on free tiers.")
