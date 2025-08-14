@@ -20,7 +20,18 @@ try:
 except Exception as e:
     st.sidebar.error(f"❌ Supabase connection failed: {e}")
 
+# --- DEBUG: always show what's in secrets (safe) ---
+import supabase as _sb
 
+with st.sidebar:
+    st.header("Setup checks")
+    st.write("supabase-py version:", _sb.__version__)
+    has_url = "SUPABASE_URL" in st.secrets
+    has_key = "SUPABASE_ANON_KEY" in st.secrets
+    st.write("Has SUPABASE_URL:", has_url)
+    if has_url:
+        st.write("SUPABASE_URL:", st.secrets["SUPABASE_URL"])  # safe to display
+    st.write("Has SUPABASE_ANON_KEY:", has_key)  # don't print the key itself
 
 from supabase import create_client, Client
 from supabase.client import ClientOptions
