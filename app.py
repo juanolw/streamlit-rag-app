@@ -442,90 +442,177 @@ tab_ingest, tab_search, tab_qa = st.tabs(["📥 Ingest", "🔎 Search", "✅ QA"
 
 # -------- Ingest tab --------
 with tab_ingest:
-    st.subheader("Upload & Extract")
-    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", key="pdf_uploader")
+    st.subheader("Batch Ingest")
 
-    colA, colB = st.columns([1,1])
+    uploaded_files = st.file_uploader(
+        "Drop one or many PDF files",
+        type="pdf",
+        accept_multiple_files=True,
+        key="pdf_batch"
+    )
+
+    colA, colB, colC = st.columns([1.2, 1, 1])
     with colA:
-        max_pages_debug = st.number_input("Limit pages (0 = all)", min_value=0, value=0, step=1)
+        quiet_mode = st.toggle("Quiet mode (summaries only)", value=True,
+                               help="If on, the app won’t print page text; you’ll get a compact report instead.")
     with colB:
-        delete_first = st.checkbox("Delete existing rows for this document before upload", False)
+        limit_preview = st.slider("Preview pages per doc", 0, 3, 1,
+                                  help="How many pages to show per doc (inside its expander). Set 0 to show none.")
+    with colC:
+        max_pages_each = st.number_input("Limit pages per doc (0 = all)", min_value=0, value=0, step=1)
 
-    if uploaded_file and st.button("1) Process PDF (OCR + QA)"):
-        with st.spinner("Processing..."):
+    colD, colE, colF = st.columns([1.2, 1, 1])
+    with colD:
+        auto_upload = st.checkbox("Auto-embed & upload to Supabase", value=True,
+                                  help="After OCR, immediately embed and upload in batches. Recommended.")
+    with colE:
+        delete_existing = st.checkbox("Delete existing rows for each document", value=False,
+                                      help="Prevents duplicates when re-ingesting.")
+    with colF:
+        batch_size = st.selectbox("Upload batch size", [64, 96, 128, 192], index=2,
+                                  help="Controls memory usage and speed for embedding+upload.")
+
+    if uploaded_files and st.button("Run ingest on selected file(s)", type="primary"):
+        if auto_upload and not _supa:
+            st.error("Supabase is not configured. Add SUPABASE_URL and SUPABASE_ANON_KEY.")
+            st.stop()
+
+        model = load_embedding_model() if auto_upload else None
+        report_rows: List[Dict[str, Any]] = []
+        errors_log: List[str] = []
+
+        # Progress bar for total files
+        total_files = len(uploaded_files)
+        master_prog = st.progress(0.0, text=f"Processing 0/{total_files} files...")
+
+        for idx, file in enumerate(uploaded_files, start=1):
+            docname = file.name
+            file_zone = st.container()
+            file_prog = file_zone.progress(0.0, text=f"{docname}: starting…")
+
             try:
-                file_bytes = uploaded_file.read()
-                st.session_state["last_pdf_bytes"] = file_bytes
-                st.session_state["last_pdf_name"] = uploaded_file.name
+                file_bytes = file.read()
+                st.session_state["last_pdf_bytes"] = file_bytes  # keep latest for QA inspector
+                st.session_state["last_pdf_name"] = docname
 
-                full_text = extract_text_from_pdf(file_bytes, preset, user_words_path, base_zoom, use_trocr, timeout_sec, max_pages_debug)
-                page_chunks = extract_pages_with_metadata(file_bytes, uploaded_file.name, preset, user_words_path, base_zoom, use_trocr, timeout_sec, max_pages_debug)
-                st.session_state["pages"] = page_chunks
-                st.session_state["document_name"] = uploaded_file.name
+                # 1) OCR + per-page metrics
+                pages = extract_pages_with_metadata(
+                    file_bytes=file_bytes,
+                    document_name=docname,
+                    preset=preset,
+                    user_words_path=user_words_path,
+                    base_zoom=base_zoom,
+                    use_trocr=use_trocr,
+                    timeout_sec=timeout_sec,
+                    max_pages=max_pages_each,
+                )
 
-                st.success("Extraction complete. Page-level chunks ready.")
-                st.caption("Preview (first 5 pages):")
-                for rec in page_chunks[:5]:
-                    st.markdown(f"**{rec['document_name']} — Page {rec['page_number']}**")
-                    preview = (rec["text"] or "").replace("\n", " ")
-                    st.write((preview[:500] + ("..." if len(preview) > 500 else "")) or "_(empty page)_")
-                    st.caption(f"flags={rec['ocr_flags']}, conf={rec['avg_conf']:.1f}, len={rec['text_len']}, noisy={rec['non_alnum_ratio']:.2f}")
-                    st.divider()
+                # Summaries
+                flagged = [
+                    p for p in pages
+                    if ("low_conf" in p["ocr_flags"]
+                        or "very_short" in p["ocr_flags"]
+                        or "noisy_text" in p["ocr_flags"]
+                        or "empty" in p["ocr_flags"])
+                ]
+                avg_conf_mean = float(np.mean([p["avg_conf"] for p in pages])) if pages else 0.0
+                summary = {
+                    "document_name": docname,
+                    "pages": len(pages),
+                    "flagged": len(flagged),
+                    "pass_rate_%": round(100.0 * (len(pages) - len(flagged)) / max(len(pages), 1), 1),
+                    "avg_conf_mean": round(avg_conf_mean, 1),
+                }
+                report_rows.append(summary)
 
-                st.text_area("Full Extracted Text (debug)", full_text or "", height=250)
+                # Optional tiny preview (inside one expander per doc)
+                if not quiet_mode and limit_preview > 0:
+                    with file_zone.expander(f"Preview • {docname}  ({len(flagged)} flagged / {len(pages)} pages)"):
+                        for rec in pages[:limit_preview]:
+                            st.markdown(f"**Page {rec['page_number']}** — flags: {rec['ocr_flags']}  •  conf={rec['avg_conf']:.1f}")
+                            preview = (rec["text_norm"][:500] + ("..." if len(rec["text_norm"]) > 500 else "")) or "_(empty)_"
+                            st.write(preview)
+                            st.caption(f"engine={rec['ocr_engine']} psm={rec['ocr_psm']} zoom={rec['ocr_zoom']} attempts={rec['ocr_attempts']}")
+                            st.divider()
+
+                file_prog.progress(0.25, text=f"{docname}: OCR complete ({len(pages)} pages).")
+
+                # 2) Embeddings + upload (optional, batched)
+                inserted = 0
+                if auto_upload and _supa:
+                    if delete_existing:
+                        try:
+                            _supa.table("document_chunks").delete().eq("document_name", docname).execute()
+                        except Exception as e:
+                            errors_log.append(f"{docname}: delete failed — {e}")
+
+                    texts_batch: List[str] = []
+                    rows_batch: List[Dict[str, Any]] = []
+
+                    def flush_batch():
+                        nonlocal inserted, texts_batch, rows_batch
+                        if not texts_batch:
+                            return
+                        vecs = embed_texts(model, texts_batch)  # normalized embeddings
+                        payload = []
+                        for r, v in zip(rows_batch, vecs):
+                            payload.append({
+                                "document_name": r["document_name"],
+                                "page_number": r["page_number"],
+                                "text": r["text"],
+                                "text_norm": r["text_norm"],
+                                "avg_conf": r["avg_conf"],
+                                "text_len": r["text_len"],
+                                "non_alnum_ratio": r["non_alnum_ratio"],
+                                "ocr_engine": r["ocr_engine"],
+                                "ocr_psm": r["ocr_psm"],
+                                "ocr_zoom": r["ocr_zoom"],
+                                "ocr_attempts": r["ocr_attempts"],
+                                "ocr_flags": r["ocr_flags"],
+                                "lang_preset": r["lang_preset"],
+                                "embedding": v.tolist(),
+                            })
+                        res = _supa.table("document_chunks").insert(payload).execute()
+                        inserted += len(res.data or [])
+                        texts_batch, rows_batch = [], []
+
+                    for rec in pages:
+                        texts_batch.append(rec["text"] or "")
+                        rows_batch.append(rec)
+                        if len(texts_batch) >= batch_size:
+                            flush_batch()
+                            file_prog.progress(min(0.90, 0.25 + 0.60 * (inserted / max(len(pages), 1))),
+                                               text=f"{docname}: uploading… {inserted}/{len(pages)}")
+
+                    flush_batch()  # last partial batch
+                    file_prog.progress(0.95, text=f"{docname}: uploaded {inserted} rows.")
+
+                file_prog.progress(1.0, text=f"{docname}: done.")
+                file_zone.success(f"✅ {docname} — pages: {summary['pages']} • flagged: {summary['flagged']} • pass-rate: {summary['pass_rate_%']}%")
+
             except Exception as e:
-                st.error("PDF processing failed.")
-                st.exception(e)
+                errors_log.append(f"{docname}: {e}")
+                file_zone.error(f"❌ {docname}: {e}")
 
-    st.subheader("Embed & Upload to Supabase")
-    if not _supa:
-        st.warning("Supabase is not configured.")
-    elif "pages" not in st.session_state or not st.session_state["pages"]:
-        st.info("No pages detected yet. Process a PDF first.")
-    else:
-        if st.button("2) Generate embeddings & upload", type="primary"):
-            try:
-                model = load_embedding_model()
-                pages = st.session_state["pages"]
-                texts = [p["text"] if p["text"] else "" for p in pages]
+            # advance master progress
+            master_prog.progress(idx / total_files, text=f"Processing {idx}/{total_files} files…")
 
-                st.info("Generating embeddings…")
-                emb = embed_texts(model, texts)
+        # Final report
+        st.markdown("---")
+        st.markdown("### Ingest Report")
+        if report_rows:
+            df = pd.DataFrame(report_rows).sort_values(["flagged", "pages"], ascending=[False, False])
+            st.dataframe(df, use_container_width=True)
+            csv = df.to_csv(index=False).encode("utf-8")
+            st.download_button("Download report (CSV)", data=csv, file_name="ingest_report.csv", mime="text/csv")
 
-                rows = []
-                for p, vec in zip(pages, emb):
-                    rows.append({
-                        "document_name": p["document_name"], "page_number": p["page_number"],
-                        "text": p["text"], "text_norm": p["text_norm"],
-                        "avg_conf": p["avg_conf"], "text_len": p["text_len"], "non_alnum_ratio": p["non_alnum_ratio"],
-                        "ocr_engine": p["ocr_engine"], "ocr_psm": p["ocr_psm"], "ocr_zoom": p["ocr_zoom"],
-                        "ocr_attempts": p["ocr_attempts"], "ocr_flags": p["ocr_flags"], "lang_preset": p["lang_preset"],
-                        "embedding": vec.tolist(),
-                    })
-
-                if delete_first:
-                    try:
-                        _ = _supa.table("document_chunks").delete().eq("document_name", st.session_state.get("document_name", "")).execute()
-                        st.info("Old rows deleted.")
-                    except Exception as e:
-                        st.warning(f"Delete failed: {e}")
-
-                st.info("Uploading to Supabase…")
-                BATCH = 100; inserted = 0
-                for i in range(0, len(rows), BATCH):
-                    batch = rows[i : i + BATCH]
-                    res = _supa.table("document_chunks").insert(batch).execute()
-                    if getattr(res, "data", None) is None:
-                        st.error("Insert returned no data. Check RLS and table schema.")
-                        st.write(res); st.stop()
-                    inserted += len(res.data)
-                    st.write(f"Inserted rows {i+1}–{i+len(batch)} (total {inserted})")
-                    time.sleep(0.05)
-
-                st.success(f"All chunks uploaded. Total inserted: {inserted}")
-            except Exception as e:
-                st.error("Embedding or upload failed.")
-                st.exception(e)
+        if errors_log:
+            st.error("Some files had issues.")
+            err_txt = "\n".join(errors_log)
+            st.text(err_txt)
+            st.download_button("Download error log", data=err_txt, file_name="ingest_errors.txt", mime="text/plain")
+        else:
+            st.success("Batch ingest completed with no errors.")
 
 # -------- Search tab --------
 with tab_search:
