@@ -785,32 +785,44 @@ else:
                 st.error("Search failed.")
                 st.exception(e)
 
-# ===================== 🔍 Page Inspector & Re-OCR =====================
-st.divider()
-with st.expander("🔍 Page Inspector & Re-OCR (single-page fix)", expanded=False):
-    if not _supa:
-        st.info("Configure Supabase first.")
+# ===================== STEP 4: Page Inspector & Re-OCR (single-page fix) =====================
+st.header("Step 4: Page Inspector & Re-OCR (single-page fix)")
+
+if not _supa:
+    st.info("Configure Supabase first (add SUPABASE_URL and SUPABASE_ANON_KEY to Secrets).")
+else:
+    # Quick debug row so you know you're on the latest build and we have the PDF in memory
+    dbg1, dbg2, dbg3 = st.columns(3)
+    with dbg1:
+        st.caption(f"Build: {BUILD_ID}")
+    with dbg2:
+        st.caption("Last uploaded PDF: " + (st.session_state.get("last_pdf_name") or "none"))
+    try:
+        _docs = _supa.table("document_chunks").select("document_name").execute()
+        _doc_names = sorted({r["document_name"] for r in (_docs.data or []) if r.get("document_name")})
+    except Exception:
+        _doc_names = []
+    with dbg3:
+        st.caption(f"Docs in DB: {len(_doc_names)}")
+
+    if not _doc_names:
+        st.info("No documents found in Supabase. Run Step 2 (Embed & Upload) first.")
     else:
-        # Pick a document & page to inspect
-        try:
-            _docs = _supa.table("document_chunks").select("document_name").execute()
-            _doc_names = sorted({r["document_name"] for r in (_docs.data or []) if r.get("document_name")})
-        except Exception:
-            _doc_names = []
-        doc_to_fix = st.selectbox("Select document to inspect", _doc_names)
-        page_to_fix = st.number_input("Page number to inspect", min_value=1, value=3, step=1)
-        query_debug = st.text_input("Optional: test against this keyword", value="Gen. Transporting")
+        doc_to_fix = st.selectbox("Select document to inspect", _doc_names, key="ins_doc")
+        page_to_fix = st.number_input("Page number to inspect", min_value=1, value=3, step=1, key="ins_page")
+        query_debug = st.text_input("Optional: test against this keyword", value="Gen. Transporting", key="ins_q")
 
         colA, colB = st.columns(2)
+
+        # --- Left: fetch the row currently stored in Supabase
         with colA:
-            if st.button("Fetch row from Supabase"):
+            if st.button("Fetch row from Supabase", key="btn_fetch_row"):
                 try:
                     r = (_supa.table("document_chunks")
                          .select("id,document_name,page_number,text,embedding")
                          .eq("document_name", doc_to_fix)
                          .eq("page_number", page_to_fix)
-                         .limit(1)
-                         .execute())
+                         .limit(1).execute())
                     row = (r.data or [None])[0]
                     if not row:
                         st.error("No row found for that document/page.")
@@ -823,9 +835,10 @@ with st.expander("🔍 Page Inspector & Re-OCR (single-page fix)", expanded=Fals
                         st.write((raw[:800] + ("..." if len(raw) > 800 else "")) or "_(empty)_")
                         st.markdown("**Normalized text (first 800 chars):**")
                         st.write((norm[:800] + ("..." if len(norm) > 800 else "")) or "_(empty)_")
+
                         if query_debug:
                             qn = normalize_text(query_debug)
-                            contains_raw = query_debug.lower() in (raw.lower())
+                            contains_raw = query_debug.lower() in raw.lower()
                             contains_norm = qn in norm
                             st.write(f"Contains (raw) = {contains_raw}  |  Contains (normalized) = {contains_norm}")
                             try:
@@ -833,21 +846,20 @@ with st.expander("🔍 Page Inspector & Re-OCR (single-page fix)", expanded=Fals
                                 score = partial_ratio(qn, norm) / 100.0
                                 st.write(f"Fuzzy score (partial_ratio vs normalized): {score:.3f}")
                             except Exception:
-                                st.caption("Install rapidfuzz for fuzzy score in-app.")
+                                st.caption("Install rapidfuzz for fuzzy score in-app (optional).")
                 except Exception as e:
                     st.error("Fetch failed.")
                     st.exception(e)
 
+        # --- Right: re-OCR this exact page using tougher settings (DPI/PSM variants)
         with colB:
-            # Re-OCR just this page, then you can update the DB row
-            if st.button("Try Re-OCR Variants (tougher settings)"):
-                # We need original PDF bytes in session
+            if st.button("Try Re-OCR Variants (tougher settings)", key="btn_reocr"):
                 bytes_ok = (
                     st.session_state.get("last_pdf_bytes") is not None
                     and st.session_state.get("last_pdf_name") == doc_to_fix
                 )
                 if not bytes_ok:
-                    st.warning("Re-upload this exact PDF in Step 1 so the app holds its bytes in memory, then come back.")
+                    st.warning("Re-upload this exact PDF in Step 1 (same file name) and click 'Process PDF', then come back.")
                 else:
                     try:
                         pdf_bytes = st.session_state["last_pdf_bytes"]
@@ -862,7 +874,7 @@ with st.expander("🔍 Page Inspector & Re-OCR (single-page fix)", expanded=Fals
                                 ("eng", "11", 3.5),
                                 ("eng", "4", 4.0),   # block layout
                             ]
-                            user_words_path = None  # or reuse your vocab file path
+                            user_words_path = None
                             tried = []
                             for lang, psm, zoom in variants:
                                 txt, conf = tesseract_ocr(
@@ -885,12 +897,13 @@ with st.expander("🔍 Page Inspector & Re-OCR (single-page fix)", expanded=Fals
                                 })
                             doc.close()
 
-                            # Show best candidates first (by fuzzy score, then length, then conf)
                             tried.sort(key=lambda d: (-d["score"], -d["len"], -d["conf"]))
                             st.success(f"Tried {len(tried)} variants. Showing top 3:")
                             for i, cand in enumerate(tried[:3], 1):
-                                st.markdown(f"**#{i} lang={cand['lang']} psm={cand['psm']} zoom={cand['zoom']} "
-                                            f"(score={cand['score']:.3f}, conf={cand['conf']:.1f}, len={cand['len']})**")
+                                st.markdown(
+                                    f"**#{i} lang={cand['lang']} psm={cand['psm']} zoom={cand['zoom']} "
+                                    f"(score={cand['score']:.3f}, conf={cand['conf']:.1f}, len={cand['len']})**"
+                                )
                                 prev = cand["text_norm"][:500] + ("..." if len(cand["text_norm"]) > 500 else "")
                                 st.write(prev or "_(empty)_")
 
@@ -899,19 +912,19 @@ with st.expander("🔍 Page Inspector & Re-OCR (single-page fix)", expanded=Fals
                         st.error("Re-OCR failed.")
                         st.exception(e)
 
-        # Update DB row with selected re-OCR candidate (also refresh embedding)
+        # --- Save chosen re-OCR back to Supabase (also refresh embedding)
         row = st.session_state.get("_inspect_row")
         cands = st.session_state.get("_re_ocr_candidates", [])
         if row and cands:
-            pick = st.selectbox(
-                "Pick a candidate to save back to Supabase",
-                [f"#{i+1}: lang={d['lang']} psm={d['psm']} zoom={d['zoom']} (score={d['score']:.3f}, conf={d['conf']:.1f})"
-                 for i, d in enumerate(cands[:5])]
-            )
-            idx = [f"#{i+1}: lang={d['lang']} psm={d['psm']} zoom={d['zoom']} (score={d['score']:.3f}, conf={d['conf']:.1f})"
-                   for i, d in enumerate(cands[:5])].index(pick)
+            labels = [
+                f"#{i+1}: lang={d['lang']} psm={d['psm']} zoom={d['zoom']} "
+                f"(score={d['score']:.3f}, conf={d['conf']:.1f})"
+                for i, d in enumerate(cands[:5])
+            ]
+            pick = st.selectbox("Pick a candidate to save", labels, key="pick_cand")
+            idx = labels.index(pick)
             chosen = cands[idx]
-            if st.button("✅ Update this page in Supabase (text, text_norm, embedding)"):
+            if st.button("✅ Update this page in Supabase (text + text_norm + embedding)", key="btn_update_page"):
                 try:
                     model = load_embedding_model()
                     vec = model.encode([chosen["text"]])[0].astype(np.float32)
@@ -921,7 +934,7 @@ with st.expander("🔍 Page Inspector & Re-OCR (single-page fix)", expanded=Fals
                         "text_norm": chosen["text_norm"],
                         "embedding": vec.tolist(),
                     }).eq("id", row["id"]).execute()
-                    st.success("Page updated. Re-run your search.")
+                    st.success("Page updated. Re-run your search in Step 3.")
                 except Exception as e:
                     st.error("Update failed.")
                     st.exception(e)
