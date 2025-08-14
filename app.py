@@ -1,5 +1,5 @@
 # app.py — Single sleek tab bar (Apple-like), OCR → Embeddings → Supabase → Search + QA
-# NOTE: Compatible with supabase-py >= 2.5; no use of 'asc=' in .order()
+# Compatible with supabase-py >= 2.5 (no 'asc=' kwargs in .order())
 
 import io
 import re
@@ -27,7 +27,7 @@ try:
 except Exception:
     partial_ratio = None
 
-BUILD_ID = "one-bar-pro-2025-08-14"
+BUILD_ID = "one-bar-pro-with-QA-sliders-2025-08-14"
 
 st.set_page_config(
     page_title="RAG • OCR | Search | QA",
@@ -41,10 +41,7 @@ st.markdown(
     """
 <style>
 /* Font stack (SF-like) */
-@font-face {
-  font-family: "InterVar";
-  src: local("Inter");
-}
+@font-face { font-family: "InterVar"; src: local("Inter"); }
 :root {
   --bg: var(--background-color);
   --bg-2: var(--secondary-background-color);
@@ -55,8 +52,6 @@ st.markdown(
 html, body, [class*="css"] {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, system-ui, sans-serif;
 }
-
-/* Tighter container + generous breathing room */
 .main .block-container { padding-top: 0.8rem; padding-bottom: 4.2rem; }
 
 /* SINGLE sticky nav (the tabs themselves) */
@@ -69,7 +64,6 @@ html, body, [class*="css"] {
   backdrop-filter: blur(10px);
   box-shadow: var(--glow);
 }
-
 /* Large pill tabs */
 .stTabs [role="tablist"] { gap: 10px; }
 .stTabs [role="tab"] {
@@ -165,6 +159,27 @@ with st.sidebar:
                 f.write(vf.read())
             st.caption(f"Custom vocab saved to {user_words_path}")
 
+    # -------- QA Threshold sliders (NEW) --------
+    st.markdown("---")
+    st.header("QA Thresholds")
+    qa_min_conf = st.slider(
+        "Min OCR confidence to PASS", 0, 100,
+        60 if preset == "English (printed)" else 55,
+        help="Pages with avg_conf below this will be flagged."
+    )
+    qa_min_len = st.slider(
+        "Min characters to PASS", 0, 300,
+        20 if preset == "English (printed)" else 15, step=5,
+        help="Very short pages are often OCR misses."
+    )
+    qa_max_noisy = st.slider(
+        "Max non-alphanumeric ratio to PASS", 0.0, 1.0, 0.85, 0.01,
+        help="Higher = tolerate more symbols/spaces before flagging."
+    )
+    st.session_state["qa_min_conf"]  = qa_min_conf
+    st.session_state["qa_min_len"]   = qa_min_len
+    st.session_state["qa_max_noisy"] = qa_max_noisy
+
 # ---------------- Supabase client ----------------
 def get_supabase_client():
     url = st.secrets.get("SUPABASE_URL", "")
@@ -219,7 +234,7 @@ def load_trocr_handwritten():
     device = torch.device("cpu"); model.to(device)
     return processor, model, device
 
-# ---------------- OCR engines & QA thresholds ----------------
+# ---------------- OCR engines & QA helpers ----------------
 def render_page_to_image(page, zoom: float = 3.0) -> Image.Image:
     mat = fitz.Matrix(zoom, zoom); pix = page.get_pixmap(matrix=mat, alpha=False)
     return Image.open(io.BytesIO(pix.tobytes("png")))
@@ -265,21 +280,21 @@ def trocr_ocr(page, zoom: float) -> str:
         text = processor.batch_decode(ids, skip_special_tokens=True)[0]
     return (text or "").strip()
 
-THRESH = {
-    "English (printed)":        {"min_conf": 70, "min_len": 15, "max_noisy": 0.60},
-    "English (handwritten)":    {"min_conf": 60, "min_len": 10, "max_noisy": 0.70},
-    "Arabic (ara)":             {"min_conf": 60, "min_len": 10, "max_noisy": 0.70},
-    "Chinese (Simplified)":     {"min_conf": 60, "min_len": 10, "max_noisy": 0.70},
-    "Chinese (Traditional)":    {"min_conf": 60, "min_len": 10, "max_noisy": 0.70},
-}
-
 def qc_metrics(text_norm: str) -> Dict[str, Any]:
     n = len(text_norm); alnum = sum(ch.isalnum() for ch in text_norm)
     non_alnum_ratio = 1.0 - (alnum / n) if n else 1.0
     return {"text_len": n, "non_alnum_ratio": non_alnum_ratio}
 
+def get_thresholds_for(preset: str) -> Dict[str, Any]:
+    # Use UI values if set; fall back to safe defaults
+    mc = st.session_state.get("qa_min_conf", 60 if preset == "English (printed)" else 55)
+    ml = st.session_state.get("qa_min_len",  20 if preset == "English (printed)" else 15)
+    mn = st.session_state.get("qa_max_noisy", 0.85)
+    return {"min_conf": mc, "min_len": ml, "max_noisy": mn}
+
 def make_flags(avg_conf: float, text_norm: str, preset: str) -> List[str]:
-    t = THRESH.get(preset, THRESH["English (printed)"]); m = qc_metrics(text_norm); flags = []
+    t = get_thresholds_for(preset); m = qc_metrics(text_norm)
+    flags = []
     if avg_conf < t["min_conf"]: flags.append("low_conf")
     if m["text_len"] < t["min_len"]: flags.append("very_short")
     if m["non_alnum_ratio"] > t["max_noisy"]: flags.append("noisy_text")
@@ -516,7 +531,7 @@ with tab_ingest:
                     max_pages=max_pages_each,
                 )
 
-                # Summaries
+                # Summaries + flag breakdown (NEW)
                 flagged = [
                     p for p in pages
                     if ("low_conf" in p["ocr_flags"]
@@ -525,12 +540,20 @@ with tab_ingest:
                         or "empty" in p["ocr_flags"])
                 ]
                 avg_conf_mean = float(np.mean([p["avg_conf"] for p in pages])) if pages else 0.0
+                low_conf_count   = sum(1 for p in pages if "low_conf"   in p["ocr_flags"])
+                very_short_count = sum(1 for p in pages if "very_short" in p["ocr_flags"])
+                noisy_count      = sum(1 for p in pages if "noisy_text" in p["ocr_flags"])
+                empty_count      = sum(1 for p in pages if "empty"      in p["ocr_flags"])
                 summary = {
                     "document_name": docname,
                     "pages": len(pages),
                     "flagged": len(flagged),
                     "pass_rate_%": round(100.0 * (len(pages) - len(flagged)) / max(len(pages), 1), 1),
                     "avg_conf_mean": round(avg_conf_mean, 1),
+                    "low_conf": low_conf_count,
+                    "very_short": very_short_count,
+                    "noisy_text": noisy_count,
+                    "empty": empty_count,
                 }
                 report_rows.append(summary)
 
@@ -754,7 +777,7 @@ with tab_qa:
     else:
         st.info(
             "Use QA to spot weak OCR pages across thousands of docs:\n"
-            "• **List flagged pages** below (by confidence/length).\n"
+            "• **List flagged pages** below (by confidence/length/noise).\n"
             "• **Batch re-OCR** flagged pages for the last uploaded PDF.\n"
             "• **Inspector** lets you fix a single page with better OCR settings."
         )
@@ -799,7 +822,8 @@ with tab_qa:
         if list_btn:
             try:
                 q = _supa.table("document_chunks").select(
-                    "document_name,page_number,avg_conf,text_len,non_alnum_ratio,ocr_engine,ocr_psm,ocr_zoom,ocr_attempts"
+                    # include ocr_flags (NEW)
+                    "document_name,page_number,avg_conf,text_len,non_alnum_ratio,ocr_flags,ocr_engine,ocr_psm,ocr_zoom,ocr_attempts"
                 )
                 if sel_doc != "All": q = q.eq("document_name", sel_doc)
                 q = q.or_(f"avg_conf.lt.{min_conf},text_len.lte.10").order("document_name").order("page_number").limit(5000)
