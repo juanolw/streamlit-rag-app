@@ -1,1 +1,4 @@
-tesseract-ocr
+tesseract-ocr            # English
+tesseract-ocr-ara        # Arabic
+tesseract-ocr-chi-sim    # Chinese Simplified
+tesseract-ocr-chi-tra    # Chinese Traditional
