@@ -20,6 +20,13 @@ import supabase as _sb
 st.set_page_config(page_title="RAG: PDF → Embeddings → Search (English-first OCR)", layout="wide")
 st.title("RAG App: PDF Upload → Embeddings → Search — English-first OCR (Handwriting), Arabic/Chinese intensive")
 
+with st.sidebar:
+    try:
+        langs = pytesseract.get_languages(config="")
+        st.caption(f"Tesseract languages found: {', '.join(sorted(langs))}")
+    except Exception as _e:
+        st.caption("Tesseract language list unavailable")
+
 # ================== Sidebar Setup Checks ==================
 with st.sidebar:
     st.header("Setup checks")
