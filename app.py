@@ -478,23 +478,39 @@ else:
                     if fetch_all:
                         # Fetch ALL matches in pages of 100
                         page_size = 100
-                        first = base.order("document_name", asc=True).range(0, page_size - 1).execute()
+                        first = (
+                            base
+                            .order("document_name", desc=False)
+                            .order("page_number", desc=False)
+                            .range(0, page_size - 1)
+                            .execute()
+                        )
                         total = getattr(first, "count", None)
                         results.extend(first.data or [])
 
                         offset = page_size
                         while total is not None and offset < total:
-                            res = base.order("document_name", asc=True).range(
-                                offset, min(offset + page_size - 1, total - 1)
-                            ).execute()
+                            res = (
+                                base
+                                .order("document_name", desc=False)
+                                .order("page_number", desc=False)
+                                .range(offset, min(offset + page_size - 1, total - 1))
+                                .execute()
+                            )
                             results.extend(res.data or [])
                             offset += page_size
                     else:
-                        res = base.order("document_name", asc=True).limit(top_k).execute()
+                        res = (
+                            base
+                            .order("document_name", desc=False)
+                            .order("page_number", desc=False)
+                            .limit(top_k)
+                            .execute()
+                        )
                         results = getattr(res, "data", []) or []
                         total = getattr(res, "count", None)
 
-                    # Order nicely: by document then page number
+                    # Extra safety: final client-side sort
                     results.sort(key=lambda r: (r.get("document_name", ""), r.get("page_number") or 0))
                     st.write(f"Matches found: {total if total is not None else len(results)}")
 
