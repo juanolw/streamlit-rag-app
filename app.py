@@ -1,7 +1,8 @@
-# app.py — RAG with English-first OCR (optional handwriting via TrOCR), Arabic/Chinese, Supabase search
+# app.py — RAG with OCR, normalization, Supabase search (text + text_norm)
 import io
 import re
 import time
+import unicodedata
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -17,7 +18,7 @@ from supabase import create_client, ClientOptions
 import supabase as _sb
 
 # ===================== DEBUG: Build tag + asc scanner =====================
-BUILD_ID = "full-stack-asc-free-2025-08-14"
+BUILD_ID = "norm-search-2025-08-14"
 try:
     with open(__file__, "r", encoding="utf-8") as _f:
         _src = _f.read()
@@ -27,7 +28,7 @@ except Exception:
 # ==========================================================================
 
 st.set_page_config(page_title="RAG (OCR + Supabase)", layout="wide")
-st.title("RAG App — PDF → OCR → Embeddings → Supabase Search")
+st.title("RAG App — PDF → OCR → Embeddings → Supabase Search (normalized)")
 
 # ---------------- Sidebar: environment checks ----------------
 with st.sidebar:
@@ -63,11 +64,35 @@ if _supa:
     except Exception as e:
         st.sidebar.error(f"❌ Supabase connection failed: {e}")
 
+# ---------------- Normalization helpers ----------------
+ZW_REMOVE = dict.fromkeys(map(ord, "\u00ad\u200b\u200c\u200d\ufeff"), None)  # soft hyphen + ZW chars
+PUNCT_MAP = str.maketrans({
+    "’": "'", "‘": "'", "“": '"', "”": '"',
+    "–": "-", "—": "-", "\u00A0": " "
+})
+
+def normalize_text(s: str) -> str:
+    """Robust normalization for keyword search: hyphenation, zero-widths, quotes/dashes, NFKC, space collapse, lower."""
+    if not s:
+        return ""
+    # join hyphenated line breaks, then flatten newlines to spaces
+    s = s.replace("-\n", "")
+    s = s.replace("\n", " ")
+    # remove zero-widths & soft hyphens, standardize punctuation
+    s = s.translate(ZW_REMOVE).translate(PUNCT_MAP)
+    # Unicode normalization (compatibility), then collapse whitespace
+    s = unicodedata.normalize("NFKC", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.lower()
+
+def escape_for_or_filter(s: str) -> str:
+    """Escape commas used by PostgREST .or_() disjunction syntax."""
+    return s.replace(",", r"\,")
+
 # ---------------- Caches ----------------
 @st.cache_resource(show_spinner=True)
 def load_embedding_model():
-    # 384-dim, light & solid for retrieval
-    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")  # 384-dim
 
 @st.cache_resource(show_spinner=True)
 def load_trocr_handwritten():
@@ -80,7 +105,7 @@ def load_trocr_handwritten():
     model.to(device)
     return processor, model, device
 
-# ---------------- Page render & preprocessing ----------------
+# ---------------- Render & preprocess ----------------
 def render_page_to_image(page, zoom: float = 3.0) -> Image.Image:
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
@@ -117,17 +142,11 @@ def tesseract_ocr(
     user_words_path: Optional[str] = None,
     timeout_sec: int = 20,
 ) -> Tuple[str, float]:
-    """
-    Tesseract OCR with confidence and a hard timeout.
-    Returns (text, avg_conf). On timeout/failure, returns best-effort text with low conf.
-    """
     img = render_page_to_image(page, zoom=zoom)
     img = preprocess_image(img, do_denoise, do_autocontrast, binarize, thresh, to_gray=True)
-
     config = f"--oem 1 --psm {psm} -c preserve_interword_spaces=1"
     if user_words_path:
         config += f" --user-words {user_words_path}"
-
     try:
         data = pytesseract.image_to_data(
             img, lang=lang, config=config, output_type=TessOutput.DICT, timeout=timeout_sec
@@ -137,20 +156,17 @@ def tesseract_ocr(
         avg_conf = float(sum(confs) / len(confs)) if confs else 0.0
         text = " ".join(words) if words else ""
     except Exception:
-        # Fallback to plain string with shorter timeout
         try:
             text = pytesseract.image_to_string(img, lang=lang, config=config, timeout=max(5, timeout_sec // 2))
         except Exception:
             text = ""
         return (text or "").strip(), 0.0
-
     if not text.strip():
         try:
             text2 = pytesseract.image_to_string(img, lang=lang, config=config, timeout=timeout_sec)
             text = text2 or text
         except Exception:
             pass
-
     return (text or "").strip(), avg_conf
 
 def trocr_ocr(page, zoom: float) -> str:
@@ -182,7 +198,6 @@ def ocr_strategy(
             text2, conf2 = tesseract_ocr(page, base_zoom + 0.5, "eng", "4", True, True, True, 180, user_words_path, timeout_sec)
             return text2 if conf2 > conf else text
         return text
-
     if preset == "English (handwritten)":
         if use_trocr:
             try:
@@ -196,28 +211,24 @@ def ocr_strategy(
             text2, conf2 = tesseract_ocr(page, base_zoom + 1.0, "eng", "3", True, True, True, 170, user_words_path, timeout_sec)
             return text2 if conf2 > conf else text
         return text
-
     if preset == "Arabic (ara)":
         text, conf = tesseract_ocr(page, base_zoom, "ara", psm_rtl_cjk, True, True, True, 180, user_words_path, timeout_sec)
         if conf < 65 and intensive:
             text2, conf2 = tesseract_ocr(page, base_zoom + 0.5, "ara", "3", True, True, True, 175, user_words_path, timeout_sec)
             return text2 if conf2 > conf else text
         return text
-
     if preset == "Chinese (Simplified)":
         text, conf = tesseract_ocr(page, base_zoom, "chi_sim", psm_rtl_cjk, True, True, True, 180, user_words_path, timeout_sec)
         if conf < 65 and intensive:
             text2, conf2 = tesseract_ocr(page, base_zoom + 0.5, "chi_sim", "3", True, True, True, 175, user_words_path, timeout_sec)
             return text2 if conf2 > conf else text
         return text
-
     if preset == "Chinese (Traditional)":
         text, conf = tesseract_ocr(page, base_zoom, "chi_tra", psm_rtl_cjk, True, True, True, 180, user_words_path, timeout_sec)
         if conf < 65 and intensive:
             text2, conf2 = tesseract_ocr(page, base_zoom + 0.5, "chi_tra", "3", True, True, True, 175, user_words_path, timeout_sec)
             return text2 if conf2 > conf else text
         return text
-
     text, _ = tesseract_ocr(page, base_zoom, "eng", "6", True, True, True, 180, user_words_path, timeout_sec)
     return text
 
@@ -346,10 +357,6 @@ if uploaded_file:
                     st.write((preview[:500] + ("..." if len(preview) > 500 else "")) or "_(empty page)_")
                     st.divider()
 
-                empty_pages = [p["page_number"] for p in page_chunks if not (p["text"] or "").strip()]
-                if empty_pages:
-                    st.warning(f"OCR returned empty text on pages: {empty_pages}. Try higher zoom or keep Intensive ON.")
-
                 st.subheader("Full Extracted Text")
                 st.text_area("PDF Text Content", full_text or "", height=300)
             except Exception as e:
@@ -377,7 +384,6 @@ else:
     if st.button("2) Generate embeddings & upload", type="primary"):
         try:
             if delete_first:
-                # Optional stored procedure you may have created; fallback to direct delete
                 try:
                     _ = _supa.rpc(
                         "delete_document", {"p_document_name": st.session_state.get("document_name", "")}
@@ -398,11 +404,13 @@ else:
 
             rows = []
             for p, vec in zip(pages, emb):
+                raw = p["text"] or ""
                 rows.append(
                     {
                         "document_name": p["document_name"],
                         "page_number": p["page_number"],
-                        "text": p["text"],
+                        "text": raw,
+                        "text_norm": normalize_text(raw),
                         "embedding": vec.tolist(),
                     }
                 )
@@ -426,12 +434,44 @@ else:
 
             st.success(f"All chunks uploaded to Supabase. Total inserted: {inserted}")
             st.info(
-                "If you don't see data in Table Editor, ensure RLS is disabled on 'document_chunks' "
-                "or policies allow anon INSERT/SELECT."
+                "If you don't see data in Table Editor, ensure RLS is disabled or anon policies allow INSERT/SELECT."
             )
         except Exception as e:
             st.error("Embedding or upload failed.")
             st.exception(e)
+
+    # ---- Maintenance: Backfill text_norm for existing rows in this doc ----
+    with st.expander("Maintenance: Backfill text_norm for this document"):
+        st.caption("Use this if you indexed pages before this update. It fills text_norm so keyword search catches hyphenations/zero-width, etc.")
+        if st.button("Backfill now"):
+            try:
+                docname = st.session_state.get("document_name", "")
+                if not docname:
+                    st.warning("No document selected.")
+                else:
+                    # fetch rows in chunks
+                    total_updated = 0
+                    page = 0
+                    page_size = 500
+                    while True:
+                        q = (_supa.table("document_chunks")
+                             .select("id,text")
+                             .eq("document_name", docname)
+                             .range(page * page_size, page * page_size + page_size - 1))
+                        res = q.execute()
+                        rows = res.data or []
+                        if not rows:
+                            break
+                        for r in rows:
+                            tid = r["id"]; raw = r.get("text") or ""
+                            tn = normalize_text(raw)
+                            _supa.table("document_chunks").update({"text_norm": tn}).eq("id", tid).execute()
+                            total_updated += 1
+                        page += 1
+                    st.success(f"Backfilled text_norm for {total_updated} rows in '{docname}'.")
+            except Exception as e:
+                st.error("Backfill failed.")
+                st.exception(e)
 
 # ---------------- STEP 3: Search (Keyword / Semantic) ----------------
 st.header("Step 3: Search (Keyword / Semantic)")
@@ -448,7 +488,7 @@ else:
     selected_doc = st.selectbox("Limit to document (optional)", ["All"] + doc_names)
 
     query = st.text_input("Enter your query")
-    mode = st.radio("Search type", ["Keyword (exact text match)", "Semantic (meaning match)"])
+    mode = st.radio("Search type", ["Keyword (exact text match, normalized)", "Semantic (meaning match)"])
     top_k = st.slider("Results to show (when not returning all)", 5, 200, 50)
     fetch_all = st.checkbox("Return all keyword matches (may be slower)")
 
@@ -467,7 +507,7 @@ else:
                 res = (
                     _supa.table("document_chunks")
                     .select("document_name,page_number,text")
-                    .order("id", desc=True)  # newest first (valid kwarg)
+                    .order("id", desc=True)
                     .limit(3)
                     .execute()
                 )
@@ -484,43 +524,35 @@ else:
                 total = None
 
                 if mode.startswith("Keyword"):
-                    base = (
-                        _supa.table("document_chunks")
-                        .select("document_name,page_number,text", count="exact")
-                        .ilike("text", f"%{query}%")
-                    )
+                    norm_query = normalize_text(query)
+                    oq = escape_for_or_filter(query)
+                    onq = escape_for_or_filter(norm_query)
+
+                    base = _supa.table("document_chunks").select("document_name,page_number,text", count="exact")
+                    # Search across raw and normalized columns
+                    base = base.or_(f"text.ilike.%{oq}%,text_norm.ilike.%{onq}%")
                     if selected_doc != "All":
                         base = base.eq("document_name", selected_doc)
 
                     if fetch_all:
-                        # Fetch ALL matches in pages of 100 (ascending by default)
                         page_size = 100
                         first = (
-                            base.order("document_name")
-                                .order("page_number")
-                                .range(0, page_size - 1)
-                                .execute()
+                            base.order("document_name").order("page_number")
+                                .range(0, page_size - 1).execute()
                         )
                         total = getattr(first, "count", None)
                         results = list(first.data or [])
-
                         offset = page_size
                         while total is not None and offset < total:
                             chunk = (
-                                base.order("document_name")
-                                    .order("page_number")
+                                base.order("document_name").order("page_number")
                                     .range(offset, min(offset + page_size - 1, total - 1))
                                     .execute()
                             )
                             results.extend(chunk.data or [])
                             offset += page_size
                     else:
-                        res = (
-                            base.order("document_name")
-                                .order("page_number")
-                                .limit(top_k)
-                                .execute()
-                        )
+                        res = base.order("document_name").order("page_number").limit(top_k).execute()
                         results = getattr(res, "data", []) or []
                         total = getattr(res, "count", None)
 
@@ -564,10 +596,8 @@ else:
                 st.exception(e)
 
 # ---------------- Footer ----------------
-with st.expander("Free-tier tips"):
+with st.expander("Notes"):
     st.markdown(
-        "- For long PDFs, set **Limit pages** to 5–10 for a quick test.\n"
-        "- Use **English (handwritten)** + **TrOCR** only on pages that truly need it (heavier CPU).\n"
-        "- For Arabic/Chinese scans, keep **Intensive** ON and try zoom 3.5–4.0 if needed.\n"
-        "- Ensure RLS is disabled or anon policies allow INSERT/SELECT on `document_chunks`."
+        "- Keyword search now hits **raw** and **normalized** text (joins hyphenated line breaks, removes zero-width chars, normalizes quotes/dashes), fixing missed matches on certain pages.\n"
+        "- Use the *Backfill* tool above for documents uploaded before this update so older rows get `text_norm`."
     )
