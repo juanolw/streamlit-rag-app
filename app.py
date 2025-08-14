@@ -476,7 +476,7 @@ else:
                 res = (
                     _supa.table("document_chunks")
                     .select("document_name,page_number,text")
-                    .order("id", desc=True)  # newest first
+                    .order("id", desc=True)  # newest first (this kwarg is supported)
                     .limit(3)
                     .execute()
                 )
@@ -533,6 +533,7 @@ else:
                         results = getattr(res, "data", []) or []
                         total = getattr(res, "count", None)
 
+                    # Final safety sort
                     results.sort(key=lambda r: (r.get("document_name", ""), r.get("page_number") or 0))
                     st.write(f"Matches found: {total if total is not None else len(results)}")
 
