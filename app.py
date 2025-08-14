@@ -451,8 +451,13 @@ else:
     with c2:
         if st.button("Show 3 most recent rows"):
             try:
-                q = _supa.table("document_chunks").select("document_name,page_number,text").order("id", desc=True).limit(3)
-                res = q.execute()
+                res = (
+                    _supa.table("document_chunks")
+                    .select("document_name,page_number,text")
+                    .order("id", desc=True)  # newest first
+                    .limit(3)
+                    .execute()
+                )
                 st.write(res.data)
             except Exception as e:
                 st.error(f"Preview failed: {e}")
@@ -476,41 +481,38 @@ else:
                         base = base.eq("document_name", selected_doc)
 
                     if fetch_all:
-                        # Fetch ALL matches in pages of 100
+                        # Fetch ALL matches (paged) — ascending order (no asc kwarg)
                         page_size = 100
                         first = (
-                            base
-                            .order("document_name", desc=False)
-                            .order("page_number", desc=False)
-                            .range(0, page_size - 1)
-                            .execute()
+                            base.order("document_name")
+                                .order("page_number")
+                                .range(0, page_size - 1)
+                                .execute()
                         )
                         total = getattr(first, "count", None)
-                        results.extend(first.data or [])
+                        results = list(first.data or [])
 
                         offset = page_size
                         while total is not None and offset < total:
-                            res = (
-                                base
-                                .order("document_name", desc=False)
-                                .order("page_number", desc=False)
-                                .range(offset, min(offset + page_size - 1, total - 1))
-                                .execute()
+                            chunk = (
+                                base.order("document_name")
+                                    .order("page_number")
+                                    .range(offset, min(offset + page_size - 1, total - 1))
+                                    .execute()
                             )
-                            results.extend(res.data or [])
+                            results.extend(chunk.data or [])
                             offset += page_size
                     else:
                         res = (
-                            base
-                            .order("document_name", desc=False)
-                            .order("page_number", desc=False)
-                            .limit(top_k)
-                            .execute()
+                            base.order("document_name")
+                                .order("page_number")
+                                .limit(top_k)
+                                .execute()
                         )
                         results = getattr(res, "data", []) or []
                         total = getattr(res, "count", None)
 
-                    # Extra safety: final client-side sort
+                    # Final safety sort
                     results.sort(key=lambda r: (r.get("document_name", ""), r.get("page_number") or 0))
                     st.write(f"Matches found: {total if total is not None else len(results)}")
 
@@ -528,16 +530,13 @@ else:
                     else:
                         res = _supa.rpc(
                             "find_similar_chunks_in_doc",
-                            {
-                                "doc_name": selected_doc,
-                                "query_embedding": qv.tolist(),
-                                "match_count": top_k,
-                            },
+                            {"doc_name": selected_doc, "query_embedding": qv.tolist(), "match_count": top_k},
                         ).execute()
 
                     results = getattr(res, "data", []) or []
                     results.sort(key=lambda r: (r.get("document_name", ""), r.get("page_number") or 0))
 
+                # Render results
                 if not results:
                     st.info("No results found.")
                 else:
@@ -549,6 +548,7 @@ else:
                         st.markdown(f"**{i}. {doc} — Page {page}**")
                         st.write(snippet or "_(empty page)_")
                         st.divider()
+
             except Exception as e:
                 st.error("Search failed.")
                 st.exception(e)
