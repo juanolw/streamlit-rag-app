@@ -2,6 +2,6 @@ streamlit
 pymupdf
 pytesseract
 Pillow
-supabase
+supabase==2.4.0
 sentence-transformers
 numpy
