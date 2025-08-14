@@ -112,22 +112,26 @@ if uploaded_file:
     st.info(f"**Selected:** {uploaded_file.name} • {uploaded_file.size/1024:.1f} KB")
     if st.button("1) Process PDF", type="primary"):
         with st.spinner("Processing..."):
-            file_bytes = uploaded_file.read()
-            full_text = extract_text_from_pdf(file_bytes)
-            page_chunks = extract_pages_with_metadata(file_bytes, uploaded_file.name)
-            st.session_state["pages"] = page_chunks
-            st.session_state["document_name"] = uploaded_file.name
+            try:
+                file_bytes = uploaded_file.read()
+                full_text = extract_text_from_pdf(file_bytes)
+                page_chunks = extract_pages_with_metadata(file_bytes, uploaded_file.name)
+                st.session_state["pages"] = page_chunks
+                st.session_state["document_name"] = uploaded_file.name
 
-            st.success("Extraction complete. Page-level chunks ready.")
-            st.subheader("Per-page chunks (preview)")
-            for rec in page_chunks[:5]:
-                st.markdown(f"**{rec['document_name']} — Page {rec['page_number']}**")
-                preview = (rec["text"] or "").replace("\n", " ")
-                st.write((preview[:500] + ("..." if len(preview) > 500 else "")) or "_(empty page)_")
-                st.divider()
+                st.success("Extraction complete. Page-level chunks ready.")
+                st.subheader("Per-page chunks (preview)")
+                for rec in page_chunks[:5]:
+                    st.markdown(f"**{rec['document_name']} — Page {rec['page_number']}**")
+                    preview = (rec["text"] or "").replace("\n", " ")
+                    st.write((preview[:500] + ("..." if len(preview) > 500 else "")) or "_(empty page)_")
+                    st.divider()
 
-            st.subheader("Full Extracted Text")
-            st.text_area("PDF Text Content", full_text or "", height=300)
+                st.subheader("Full Extracted Text")
+                st.text_area("PDF Text Content", full_text or "", height=300)
+            except Exception as e:
+                st.error("PDF processing failed.")
+                st.exception(e)
 
 # ================== STEP 2: Embed & Upload to Supabase ==================
 st.header("Step 2: Embed & Upload to Supabase")
@@ -157,4 +161,98 @@ else:
                     "embedding": vec.tolist()
                 })
 
-            st
+            st.info("Uploading to Supabase…")
+            BATCH = 100
+            inserted = 0
+            for i in range(0, len(rows), BATCH):
+                batch = rows[i:i+BATCH]
+                res = _supa.table("document_chunks").insert(batch).execute()
+                if getattr(res, "data", None) is None:
+                    st.error(f"No data returned for batch {i+1}-{i+len(batch)}. "
+                             f"Check RLS (disable or add insert/select policies) and that the table exists.")
+                    st.write(res)
+                    st.stop()
+                inserted += len(res.data)
+                st.write(f"Inserted rows {i+1}–{i+len(batch)} (total {inserted})")
+                time.sleep(0.05)
+
+            st.success(f"All chunks uploaded to Supabase. Total inserted: {inserted}")
+            st.info("If you don't see data in Table Editor, ensure RLS is disabled on 'document_chunks' or policies allow anon INSERT/SELECT.")
+        except Exception as e:
+            st.error("Embedding or upload failed.")
+            st.exception(e)
+
+# ================== STEP 3: Search ==================
+st.header("Step 3: Search (Keyword / Semantic)")
+
+if not _supa:
+    st.info("Configure Supabase first to enable search.")
+else:
+    query = st.text_input("Enter your query")
+    mode = st.radio("Search type", ["Keyword (exact text match)", "Semantic (meaning match)"])
+    top_k = st.slider("Results to show", 1, 20, 5)
+
+    colA, colB = st.columns(2)
+    with colA:
+        if st.button("Check row count"):
+            try:
+                res = _supa.table("document_chunks").select("id", count="exact").limit(1).execute()
+                st.write(f"Row count: {res.count}")
+            except Exception as e:
+                st.error(f"Count failed: {e}")
+    with colB:
+        if st.button("Show 3 most recent rows"):
+            try:
+                res = _supa.table("document_chunks") \
+                           .select("document_name,page_number,text") \
+                           .order("id", desc=True).limit(3).execute()
+                st.write(res.data)
+            except Exception as e:
+                st.error(f"Preview failed: {e}")
+
+    if st.button("3) Search", type="primary"):
+        if not query:
+            st.warning("Please enter a query.")
+        else:
+            try:
+                results = []
+                if mode.startswith("Keyword"):
+                    res = _supa.table("document_chunks") \
+                               .select("document_name,page_number,text") \
+                               .ilike("text", f"%{query}%") \
+                               .limit(top_k).execute()
+                    results = getattr(res, "data", []) or []
+                else:
+                    # Semantic: embed query, call RPC (ensure it exists in Supabase)
+                    model = load_embedding_model()
+                    q = model.encode([query])[0].astype(np.float32)
+                    q /= (np.linalg.norm(q) + 1e-12)
+                    res = _supa.rpc("find_similar_chunks", {
+                        "query_embedding": q.tolist(),
+                        "match_count": top_k
+                    }).execute()
+                    results = getattr(res, "data", []) or []
+
+                if not results:
+                    st.info("No results found.")
+                else:
+                    for i, r in enumerate(results, 1):
+                        doc = r.get("document_name", "Unknown")
+                        page = r.get("page_number", "?")
+                        text = (r.get("text") or "").replace("\n", " ")
+                        snippet = text[:400] + ("..." if len(text) > 400 else "")
+                        st.markdown(f"**{i}. {doc} — Page {page}**")
+                        st.write(snippet or "_(empty page)_")
+                        st.divider()
+            except Exception as e:
+                st.error("Search failed.")
+                st.exception(e)
+
+# ================== Footer Tips ==================
+with st.expander("Free-tier tips"):
+    st.markdown(
+        "- Supabase free DB is ~500 MB; fine for thousands of pages.\n"
+        "- If inserts fail, check **RLS** (disable, or add anon SELECT/INSERT policies).\n"
+        "- This app sleeps when idle; no cost while dormant.\n"
+        "- Embedding model is small and free (HF). Large PDFs will be slower."
+    )
