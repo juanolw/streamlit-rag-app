@@ -6,20 +6,21 @@ import pytesseract
 from PIL import Image
 
 # --- DEBUG: Supabase connection test ---
-from supabase import create_client
+from supabase import create_client, Client
+from supabase.client import ClientOptions
 
-if "SUPABASE_URL" in st.secrets and "SUPABASE_ANON_KEY" in st.secrets:
+def get_supabase_client() -> Client | None:
+    url = st.secrets.get("SUPABASE_URL", "")
+    key = st.secrets.get("SUPABASE_ANON_KEY", "")
+    if not url or not key:
+        return None
     try:
-        supa_test = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_ANON_KEY"])
-        # Try a harmless query (just count rows in document_chunks)
-        res = supa_test.table("document_chunks").select("id", count="exact").limit(1).execute()
-        st.sidebar.success(f"✅ Supabase connected. Table rows: {res.count}")
+        # NOTE: pass an explicit empty options object
+        return create_client(url, key, options=ClientOptions())
     except Exception as e:
-        st.sidebar.error(f"❌ Supabase connection failed: {e}")
+        st.sidebar.error(f"Supabase init failed: {e}")
+        return None
 
-st.set_page_config(page_title="PDF Text Extractor (RAG - Part 1 & 2.1)", layout="wide")
-st.title("PDF Text Extractor")
-st.caption("Uploads a PDF, extracts text (with OCR fallback), and builds page-level chunks with document and page metadata.")
 
 # ---------- Helpers ----------
 
