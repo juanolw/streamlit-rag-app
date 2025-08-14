@@ -1,10 +1,12 @@
-# app.py — RAG with OCR, normalization, Supabase search (text + text_norm)
+# app.py — RAG: PDF → OCR → normalize → embed → Supabase → search
+# Modes: Keyword (exact/normalized), Keyword (fuzzy w/ pg_trgm or local fallback), Semantic (RPC or local)
+
 import io
 import re
 import time
 import unicodedata
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
 
 import numpy as np
 import streamlit as st
@@ -17,8 +19,14 @@ from sentence_transformers import SentenceTransformer
 from supabase import create_client, ClientOptions
 import supabase as _sb
 
+# Optional, used for local fuzzy fallback:
+try:
+    from rapidfuzz.fuzz import partial_ratio
+except Exception:
+    partial_ratio = None  # We'll handle gracefully if not installed
+
 # ===================== DEBUG: Build tag + asc scanner =====================
-BUILD_ID = "norm-search-2025-08-14"
+BUILD_ID = "full-python-stack-ocr-fuzzy-2025-08-14"
 try:
     with open(__file__, "r", encoding="utf-8") as _f:
         _src = _f.read()
@@ -28,7 +36,7 @@ except Exception:
 # ==========================================================================
 
 st.set_page_config(page_title="RAG (OCR + Supabase)", layout="wide")
-st.title("RAG App — PDF → OCR → Embeddings → Supabase Search (normalized)")
+st.title("RAG App — PDF → OCR → Embeddings → Supabase Search")
 
 # ---------------- Sidebar: environment checks ----------------
 with st.sidebar:
@@ -65,34 +73,41 @@ if _supa:
         st.sidebar.error(f"❌ Supabase connection failed: {e}")
 
 # ---------------- Normalization helpers ----------------
-ZW_REMOVE = dict.fromkeys(map(ord, "\u00ad\u200b\u200c\u200d\ufeff"), None)  # soft hyphen + ZW chars
+ZW_REMOVE = dict.fromkeys(map(ord, "\u00ad\u200b\u200c\u200d\ufeff"), None)  # soft hyphen + zero-widths
 PUNCT_MAP = str.maketrans({
     "’": "'", "‘": "'", "“": '"', "”": '"',
-    "–": "-", "—": "-", "\u00A0": " "
+    "–": "-", "—": "-", "\u00A0": " ", "·": " "
 })
+_PUNCT_STRIP_RE = re.compile(r"[.,:;|/\\()\[\]{}<>•·…]+")
+_SPACE_COLLAPSE_RE = re.compile(r"\s+")
 
 def normalize_text(s: str) -> str:
-    """Robust normalization for keyword search: hyphenation, zero-widths, quotes/dashes, NFKC, space collapse, lower."""
+    """
+    Aggressive normalization for keyword matching:
+    - join hyphenated line breaks, flatten newlines
+    - remove zero-width & soft hyphen
+    - normalize quotes/dashes; strip most punctuation to spaces
+    - NFKC unicode normalize; collapse spaces; lowercase
+    """
     if not s:
         return ""
-    # join hyphenated line breaks, then flatten newlines to spaces
-    s = s.replace("-\n", "")
-    s = s.replace("\n", " ")
-    # remove zero-widths & soft hyphens, standardize punctuation
+    s = s.replace("-\n", "")          # de-hyphenate end-of-line
+    s = s.replace("\n", " ")          # flatten newlines
     s = s.translate(ZW_REMOVE).translate(PUNCT_MAP)
-    # Unicode normalization (compatibility), then collapse whitespace
     s = unicodedata.normalize("NFKC", s)
-    s = re.sub(r"\s+", " ", s).strip()
+    s = _PUNCT_STRIP_RE.sub(" ", s)   # turn .,;:/()[]{}<>… into spaces
+    s = _SPACE_COLLAPSE_RE.sub(" ", s).strip()
     return s.lower()
 
 def escape_for_or_filter(s: str) -> str:
-    """Escape commas used by PostgREST .or_() disjunction syntax."""
+    # PostgREST .or_ uses comma as separator; escape commas in query
     return s.replace(",", r"\,")
 
 # ---------------- Caches ----------------
 @st.cache_resource(show_spinner=True)
 def load_embedding_model():
-    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")  # 384-dim
+    # 384-dim, light & solid for retrieval
+    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 @st.cache_resource(show_spinner=True)
 def load_trocr_handwritten():
@@ -105,7 +120,7 @@ def load_trocr_handwritten():
     model.to(device)
     return processor, model, device
 
-# ---------------- Render & preprocess ----------------
+# ---------------- Page render & preprocessing ----------------
 def render_page_to_image(page, zoom: float = 3.0) -> Image.Image:
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
@@ -142,11 +157,17 @@ def tesseract_ocr(
     user_words_path: Optional[str] = None,
     timeout_sec: int = 20,
 ) -> Tuple[str, float]:
+    """
+    Tesseract OCR with confidence and a hard timeout.
+    Returns (text, avg_conf). On timeout/failure, returns best-effort text with low conf.
+    """
     img = render_page_to_image(page, zoom=zoom)
     img = preprocess_image(img, do_denoise, do_autocontrast, binarize, thresh, to_gray=True)
+
     config = f"--oem 1 --psm {psm} -c preserve_interword_spaces=1"
     if user_words_path:
         config += f" --user-words {user_words_path}"
+
     try:
         data = pytesseract.image_to_data(
             img, lang=lang, config=config, output_type=TessOutput.DICT, timeout=timeout_sec
@@ -156,17 +177,20 @@ def tesseract_ocr(
         avg_conf = float(sum(confs) / len(confs)) if confs else 0.0
         text = " ".join(words) if words else ""
     except Exception:
+        # Fallback to plain string with shorter timeout
         try:
             text = pytesseract.image_to_string(img, lang=lang, config=config, timeout=max(5, timeout_sec // 2))
         except Exception:
             text = ""
         return (text or "").strip(), 0.0
+
     if not text.strip():
         try:
             text2 = pytesseract.image_to_string(img, lang=lang, config=config, timeout=timeout_sec)
             text = text2 or text
         except Exception:
             pass
+
     return (text or "").strip(), avg_conf
 
 def trocr_ocr(page, zoom: float) -> str:
@@ -198,6 +222,7 @@ def ocr_strategy(
             text2, conf2 = tesseract_ocr(page, base_zoom + 0.5, "eng", "4", True, True, True, 180, user_words_path, timeout_sec)
             return text2 if conf2 > conf else text
         return text
+
     if preset == "English (handwritten)":
         if use_trocr:
             try:
@@ -211,24 +236,28 @@ def ocr_strategy(
             text2, conf2 = tesseract_ocr(page, base_zoom + 1.0, "eng", "3", True, True, True, 170, user_words_path, timeout_sec)
             return text2 if conf2 > conf else text
         return text
+
     if preset == "Arabic (ara)":
         text, conf = tesseract_ocr(page, base_zoom, "ara", psm_rtl_cjk, True, True, True, 180, user_words_path, timeout_sec)
         if conf < 65 and intensive:
             text2, conf2 = tesseract_ocr(page, base_zoom + 0.5, "ara", "3", True, True, True, 175, user_words_path, timeout_sec)
             return text2 if conf2 > conf else text
         return text
+
     if preset == "Chinese (Simplified)":
         text, conf = tesseract_ocr(page, base_zoom, "chi_sim", psm_rtl_cjk, True, True, True, 180, user_words_path, timeout_sec)
         if conf < 65 and intensive:
             text2, conf2 = tesseract_ocr(page, base_zoom + 0.5, "chi_sim", "3", True, True, True, 175, user_words_path, timeout_sec)
             return text2 if conf2 > conf else text
         return text
+
     if preset == "Chinese (Traditional)":
         text, conf = tesseract_ocr(page, base_zoom, "chi_tra", psm_rtl_cjk, True, True, True, 180, user_words_path, timeout_sec)
         if conf < 65 and intensive:
             text2, conf2 = tesseract_ocr(page, base_zoom + 0.5, "chi_tra", "3", True, True, True, 175, user_words_path, timeout_sec)
             return text2 if conf2 > conf else text
         return text
+
     text, _ = tesseract_ocr(page, base_zoom, "eng", "6", True, True, True, 180, user_words_path, timeout_sec)
     return text
 
@@ -383,6 +412,12 @@ else:
 
     if st.button("2) Generate embeddings & upload", type="primary"):
         try:
+            # ensure text_norm column exists (silent if not)
+            try:
+                _ = _supa.table("document_chunks").select("text_norm").limit(1).execute()
+            except Exception:
+                st.warning("Column text_norm not found. Create it in Supabase: ALTER TABLE document_chunks ADD COLUMN text_norm text;")
+
             if delete_first:
                 try:
                     _ = _supa.rpc(
@@ -442,14 +477,13 @@ else:
 
     # ---- Maintenance: Backfill text_norm for existing rows in this doc ----
     with st.expander("Maintenance: Backfill text_norm for this document"):
-        st.caption("Use this if you indexed pages before this update. It fills text_norm so keyword search catches hyphenations/zero-width, etc.")
+        st.caption("Use this if you indexed pages before this update so older rows get `text_norm`.")
         if st.button("Backfill now"):
             try:
                 docname = st.session_state.get("document_name", "")
                 if not docname:
                     st.warning("No document selected.")
                 else:
-                    # fetch rows in chunks
                     total_updated = 0
                     page = 0
                     page_size = 500
@@ -473,7 +507,55 @@ else:
                 st.error("Backfill failed.")
                 st.exception(e)
 
-# ---------------- STEP 3: Search (Keyword / Semantic) ----------------
+# ---------------- Helpers: local fuzzy + semantic fallback ----------------
+def local_fuzzy_search(rows: List[Dict[str, Any]], query: str, top_k: int = 50) -> List[Dict[str, Any]]:
+    """
+    Fuzzy search across rows (each with text_norm). Uses rapidfuzz.partial_ratio if available,
+    else Python difflib fallback (slower).
+    """
+    qn = normalize_text(query)
+    if not qn:
+        return []
+    results = []
+    use_rf = partial_ratio is not None
+    # Prefilter by token presence to reduce work
+    tokens = [t for t in qn.split() if len(t) >= 3]
+    for r in rows:
+        tn = normalize_text(r.get("text", ""))
+        if tokens and not any(t in tn for t in tokens):
+            continue
+        if use_rf:
+            score = partial_ratio(qn, tn)
+        else:
+            # simple heuristic if rapidfuzz not installed
+            score = 100 if qn in tn else (80 if tn.find(tokens[0]) >= 0 else 0) if tokens else (100 if qn in tn else 0)
+        results.append({**r, "sim": float(score) / 100.0})
+    results.sort(key=lambda x: (-x.get("sim", 0.0), x.get("document_name", ""), x.get("page_number") or 0))
+    return results[:top_k]
+
+def local_semantic_search(rows: List[Dict[str, Any]], query_vec: np.ndarray, top_k: int = 50) -> List[Dict[str, Any]]:
+    embs = [np.array(r["embedding"], dtype=np.float32) for r in rows if r.get("embedding") is not None]
+    if not embs:
+        return []
+    M = np.vstack(embs)
+    M /= (np.linalg.norm(M, axis=1, keepdims=True) + 1e-12)
+    q = query_vec.astype(np.float32)
+    q /= (np.linalg.norm(q) + 1e-12)
+    sims = M @ q
+    idxs = np.argsort(-sims)[:top_k]
+    # Need to map back to rows; ensure alignment
+    kept = []
+    j = 0
+    for r in rows:
+        if r.get("embedding") is None:
+            continue
+        if j in idxs:
+            kept.append({k: r[k] for k in ("document_name", "page_number", "text") if k in r} | {"sim": float(sims[j])})
+        j += 1
+    kept.sort(key=lambda x: (-x.get("sim", 0.0), x.get("document_name", ""), x.get("page_number") or 0))
+    return kept
+
+# ---------------- STEP 3: Search (Keyword / Fuzzy / Semantic) ----------------
 st.header("Step 3: Search (Keyword / Semantic)")
 
 if not _supa:
@@ -487,10 +569,15 @@ else:
         doc_names = []
     selected_doc = st.selectbox("Limit to document (optional)", ["All"] + doc_names)
 
-    query = st.text_input("Enter your query")
-    mode = st.radio("Search type", ["Keyword (exact text match, normalized)", "Semantic (meaning match)"])
-    top_k = st.slider("Results to show (when not returning all)", 5, 200, 50)
-    fetch_all = st.checkbox("Return all keyword matches (may be slower)")
+    query = st.text_input("Enter your query (e.g., Gen. Transporting)")
+    mode = st.radio(
+        "Search type",
+        ["Keyword (exact/normalized)", "Keyword (fuzzy)", "Semantic (meaning match)"],
+        index=0
+    )
+    top_k = st.slider("Results to show", 5, 200, 50)
+    fetch_all = st.checkbox("Return all matches (only applies to exact/normalized)")
+    max_scan = st.number_input("Max rows to scan in local fuzzy/semantic fallback", 100, 20000, 5000, step=100)
 
     # Quick checks
     c1, c2 = st.columns(2)
@@ -507,7 +594,7 @@ else:
                 res = (
                     _supa.table("document_chunks")
                     .select("document_name,page_number,text")
-                    .order("id", desc=True)
+                    .order("id", desc=True)  # newest first (valid kwarg)
                     .limit(3)
                     .execute()
                 )
@@ -520,16 +607,16 @@ else:
             st.warning("Please enter a query.")
         else:
             try:
-                results = []
+                results: List[Dict[str, Any]] = []
                 total = None
 
-                if mode.startswith("Keyword"):
+                if mode.startswith("Keyword (exact/normalized)"):
+                    # Exact-ish: search raw TEXT and TEXT_NORM with ILIKE (fast & simple)
                     norm_query = normalize_text(query)
                     oq = escape_for_or_filter(query)
                     onq = escape_for_or_filter(norm_query)
 
                     base = _supa.table("document_chunks").select("document_name,page_number,text", count="exact")
-                    # Search across raw and normalized columns
                     base = base.or_(f"text.ilike.%{oq}%,text_norm.ilike.%{onq}%")
                     if selected_doc != "All":
                         base = base.eq("document_name", selected_doc)
@@ -537,7 +624,8 @@ else:
                     if fetch_all:
                         page_size = 100
                         first = (
-                            base.order("document_name").order("page_number")
+                            base.order("document_name")
+                                .order("page_number")
                                 .range(0, page_size - 1).execute()
                         )
                         total = getattr(first, "count", None)
@@ -545,7 +633,8 @@ else:
                         offset = page_size
                         while total is not None and offset < total:
                             chunk = (
-                                base.order("document_name").order("page_number")
+                                base.order("document_name")
+                                    .order("page_number")
                                     .range(offset, min(offset + page_size - 1, total - 1))
                                     .execute()
                             )
@@ -559,26 +648,122 @@ else:
                     results.sort(key=lambda r: (r.get("document_name", ""), r.get("page_number") or 0))
                     st.write(f"Matches found: {total if total is not None else len(results)}")
 
+                elif mode.startswith("Keyword (fuzzy)"):
+                    norm_query = normalize_text(query)
+
+                    # Try RPC first (if you created pg_trgm functions)
+                    rpc_ok = True
+                    try:
+                        if selected_doc == "All":
+                            res = _supa.rpc("fuzzy_find_chunks_all",
+                                            {"qnorm": norm_query, "limit_n": top_k}).execute()
+                        else:
+                            res = _supa.rpc("fuzzy_find_chunks_in_doc",
+                                            {"docname": selected_doc, "qnorm": norm_query, "limit_n": top_k}).execute()
+                        results = getattr(res, "data", []) or []
+                        # Fields from RPC: document_name, page_number, text, sim
+                        results.sort(key=lambda r: (-r.get("sim", 0.0), r.get("document_name", ""), r.get("page_number") or 0))
+                        st.write(f"Top {len(results)} fuzzy matches (server-side).")
+                    except Exception:
+                        rpc_ok = False
+
+                    # Local fallback if RPC not available
+                    if not rpc_ok:
+                        # Fetch candidates
+                        if selected_doc == "All":
+                            # Page through to max_scan
+                            fetched: List[Dict[str, Any]] = []
+                            offset = 0
+                            page_size = 1000
+                            while offset < max_scan:
+                                chunk = (
+                                    _supa.table("document_chunks")
+                                    .select("document_name,page_number,text")
+                                    .order("document_name")
+                                    .order("page_number")
+                                    .range(offset, offset + page_size - 1)
+                                    .execute()
+                                )
+                                data = chunk.data or []
+                                if not data:
+                                    break
+                                fetched.extend(data)
+                                offset += len(data)
+                                if len(fetched) >= max_scan:
+                                    break
+                            results = local_fuzzy_search(fetched, query, top_k=top_k)
+                        else:
+                            # Restrict to one document
+                            fetched = []
+                            offset = 0
+                            page_size = 2000
+                            while offset < max_scan:
+                                chunk = (
+                                    _supa.table("document_chunks")
+                                    .select("document_name,page_number,text")
+                                    .eq("document_name", selected_doc)
+                                    .order("page_number")
+                                    .range(offset, offset + page_size - 1)
+                                    .execute()
+                                )
+                                data = chunk.data or []
+                                if not data:
+                                    break
+                                fetched.extend(data)
+                                offset += len(data)
+                                if len(fetched) >= max_scan:
+                                    break
+                            results = local_fuzzy_search(fetched, query, top_k=top_k)
+
+                        st.write(f"Top {len(results)} fuzzy matches (local fallback).")
+
                 else:
-                    # Semantic: embed query, call RPC(s)
+                    # Semantic (RPC first, local fallback else)
                     model = load_embedding_model()
                     qv = model.encode([query])[0].astype(np.float32)
                     qv /= (np.linalg.norm(qv) + 1e-12)
 
-                    if selected_doc == "All":
-                        res = _supa.rpc(
-                            "find_similar_chunks",
-                            {"query_embedding": qv.tolist(), "match_count": top_k},
-                        ).execute()
-                    else:
-                        res = _supa.rpc(
-                            "find_similar_chunks_in_doc",
-                            {"doc_name": selected_doc, "query_embedding": qv.tolist(), "match_count": top_k},
-                        ).execute()
+                    rpc_ok = True
+                    try:
+                        if selected_doc == "All":
+                            res = _supa.rpc(
+                                "find_similar_chunks",
+                                {"query_embedding": qv.tolist(), "match_count": top_k},
+                            ).execute()
+                        else:
+                            res = _supa.rpc(
+                                "find_similar_chunks_in_doc",
+                                {"doc_name": selected_doc, "query_embedding": qv.tolist(), "match_count": top_k},
+                            ).execute()
+                        results = getattr(res, "data", []) or []
+                        results.sort(key=lambda r: (r.get("document_name", ""), r.get("page_number") or 0))
+                        st.write(f"Top {len(results)} semantic matches (server-side).")
+                    except Exception:
+                        rpc_ok = False
 
-                    results = getattr(res, "data", []) or []
-                    results.sort(key=lambda r: (r.get("document_name", ""), r.get("page_number") or 0))
+                    if not rpc_ok:
+                        # Local semantic: fetch embeddings and score
+                        fetched = []
+                        offset = 0
+                        page_size = 500
+                        while offset < max_scan:
+                            q = _supa.table("document_chunks").select("document_name,page_number,text,embedding")
+                            if selected_doc != "All":
+                                q = q.eq("document_name", selected_doc)
+                            q = q.order("document_name").order("page_number").range(offset, offset + page_size - 1)
+                            chunk = q.execute()
+                            data = chunk.data or []
+                            if not data:
+                                break
+                            # keep only rows with embeddings
+                            fetched.extend([d for d in data if isinstance(d.get("embedding"), list)])
+                            offset += len(data)
+                            if len(fetched) >= max_scan:
+                                break
+                        results = local_semantic_search(fetched, qv, top_k=top_k)
+                        st.write(f"Top {len(results)} semantic matches (local fallback).")
 
+                # Render results
                 if not results:
                     st.info("No results found.")
                 else:
@@ -589,6 +774,8 @@ else:
                         snippet = text[:400] + ("..." if len(text) > 400 else "")
                         st.markdown(f"**{i}. {doc} — Page {page}**")
                         st.write(snippet or "_(empty page)_")
+                        if "sim" in r:
+                            st.caption(f"Similarity: {r['sim']:.3f}")
                         st.divider()
 
             except Exception as e:
@@ -596,8 +783,10 @@ else:
                 st.exception(e)
 
 # ---------------- Footer ----------------
-with st.expander("Notes"):
+with st.expander("Notes & Tips"):
     st.markdown(
-        "- Keyword search now hits **raw** and **normalized** text (joins hyphenated line breaks, removes zero-width chars, normalizes quotes/dashes), fixing missed matches on certain pages.\n"
-        "- Use the *Backfill* tool above for documents uploaded before this update so older rows get `text_norm`."
+        "- Keyword search hits both **raw** and **normalized** text (hyphenation joined, zero-width removed, quotes/dashes normalized).\n"
+        "- **Fuzzy** search uses Postgres `pg_trgm` RPC if present; otherwise it falls back to a local fuzzy scorer (add `rapidfuzz` for speed).\n"
+        "- For long PDFs, set **Limit pages** for quick tests; enable **Intensive** if a page looks under-read.\n"
+        "- Ensure RLS is disabled or anon policies allow INSERT/SELECT on `document_chunks`."
     )
