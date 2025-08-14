@@ -5,6 +5,13 @@ import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
 
+# --- DEBUG: Check secrets ---
+if "SUPABASE_URL" in st.secrets and "SUPABASE_ANON_KEY" in st.secrets:
+    st.sidebar.success("✅ Supabase secrets loaded.")
+    st.sidebar.write("Supabase URL:", st.secrets["SUPABASE_URL"])
+else:
+    st.sidebar.error("❌ Supabase secrets NOT found. Check Settings → Secrets in Streamlit Cloud.")
+
 st.set_page_config(page_title="PDF Text Extractor (RAG - Part 1 & 2.1)", layout="wide")
 st.title("PDF Text Extractor")
 st.caption("Uploads a PDF, extracts text (with OCR fallback), and builds page-level chunks with document and page metadata.")
