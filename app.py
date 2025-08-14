@@ -1,5 +1,6 @@
-# app.py — RAG with English-first OCR (handwriting optional), Arabic/Chinese presets, Supabase search
+# app.py — RAG with English-first OCR (optional handwriting via TrOCR), Arabic/Chinese, Supabase search
 import io
+import re
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -11,37 +12,34 @@ import pytesseract
 from pytesseract import Output as TessOutput
 from PIL import Image, ImageOps, ImageFilter
 
-# Embeddings + DB
 from sentence_transformers import SentenceTransformer
-from supabase import create_client
-from supabase.client import ClientOptions
+from supabase import create_client, ClientOptions
 import supabase as _sb
 
-BUILD_ID = "fix-asc-2025-08-14"
-import inspect, os, re
+# ===================== DEBUG: Build tag + asc scanner =====================
+BUILD_ID = "full-stack-asc-free-2025-08-14"
 try:
     with open(__file__, "r", encoding="utf-8") as _f:
-        _code = _f.read()
-    _asc_hits = len(re.findall(r"\basc\s*=", _code))
+        _src = _f.read()
+    ASC_OCCURRENCES = len(re.findall(r"\border\s*\([^)]*asc\s*=", _src))
 except Exception:
-    _asc_hits = -1
+    ASC_OCCURRENCES = -1
+# ==========================================================================
 
-with st.sidebar:
-    st.write("Build:", BUILD_ID)
-    st.write("asc= occurrences in this running file:", _asc_hits)
-    st.write("Script path:", __file__)
+st.set_page_config(page_title="RAG (OCR + Supabase)", layout="wide")
+st.title("RAG App — PDF → OCR → Embeddings → Supabase Search")
 
-# ---------- Page ----------
-st.set_page_config(page_title="RAG: PDF → Embeddings → Search (OCR-first)", layout="wide")
-st.title("RAG App: PDF Upload → Embeddings → Search — English-first OCR (Handwriting), Arabic/Chinese")
-
-# ---------- Sidebar setup checks ----------
+# ---------------- Sidebar: environment checks ----------------
 with st.sidebar:
     st.header("Setup checks")
+    st.write("Build:", BUILD_ID)
+    st.write("`asc=` occurrences in this running file:", ASC_OCCURRENCES)
     st.write("supabase-py version:", _sb.__version__)
+    if "SUPABASE_URL" in st.secrets:
+        st.caption("SUPABASE_URL: " + st.secrets["SUPABASE_URL"])
     try:
         langs = pytesseract.get_languages(config="")
-        st.caption("Tesseract languages found: " + ", ".join(sorted(langs)))
+        st.caption("Tesseract languages: " + ", ".join(sorted(langs)))
     except Exception:
         st.caption("Tesseract language list unavailable")
 
@@ -65,10 +63,11 @@ if _supa:
     except Exception as e:
         st.sidebar.error(f"❌ Supabase connection failed: {e}")
 
-# ---------- Caches ----------
+# ---------------- Caches ----------------
 @st.cache_resource(show_spinner=True)
 def load_embedding_model():
-    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")  # 384-dim
+    # 384-dim, light & solid for retrieval
+    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 @st.cache_resource(show_spinner=True)
 def load_trocr_handwritten():
@@ -81,7 +80,7 @@ def load_trocr_handwritten():
     model.to(device)
     return processor, model, device
 
-# ---------- Render & preprocess ----------
+# ---------------- Page render & preprocessing ----------------
 def render_page_to_image(page, zoom: float = 3.0) -> Image.Image:
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
@@ -105,7 +104,7 @@ def preprocess_image(
         img = img.point(lambda p: 255 if p > thresh else 0)
     return img
 
-# ---------- OCR engines ----------
+# ---------------- OCR engines ----------------
 def tesseract_ocr(
     page,
     zoom: float,
@@ -120,7 +119,7 @@ def tesseract_ocr(
 ) -> Tuple[str, float]:
     """
     Tesseract OCR with confidence and a hard timeout.
-    Returns (text, avg_conf). If timeout/failure, returns best-effort text with low conf.
+    Returns (text, avg_conf). On timeout/failure, returns best-effort text with low conf.
     """
     img = render_page_to_image(page, zoom=zoom)
     img = preprocess_image(img, do_denoise, do_autocontrast, binarize, thresh, to_gray=True)
@@ -129,7 +128,6 @@ def tesseract_ocr(
     if user_words_path:
         config += f" --user-words {user_words_path}"
 
-    # Try data (conf) first
     try:
         data = pytesseract.image_to_data(
             img, lang=lang, config=config, output_type=TessOutput.DICT, timeout=timeout_sec
@@ -139,14 +137,13 @@ def tesseract_ocr(
         avg_conf = float(sum(confs) / len(confs)) if confs else 0.0
         text = " ".join(words) if words else ""
     except Exception:
-        # Fallback to plain string (shorter timeout)
+        # Fallback to plain string with shorter timeout
         try:
             text = pytesseract.image_to_string(img, lang=lang, config=config, timeout=max(5, timeout_sec // 2))
         except Exception:
             text = ""
         return (text or "").strip(), 0.0
 
-    # If empty string, try plain string once (keep avg_conf)
     if not text.strip():
         try:
             text2 = pytesseract.image_to_string(img, lang=lang, config=config, timeout=timeout_sec)
@@ -166,7 +163,7 @@ def trocr_ocr(page, zoom: float) -> str:
         text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
     return (text or "").strip()
 
-# ---------- OCR strategy ----------
+# ---------------- OCR strategy ----------------
 def ocr_strategy(
     page,
     preset: str,
@@ -179,11 +176,6 @@ def ocr_strategy(
     psm_rtl_cjk: str = "4",
     intensive: bool = False,
 ) -> str:
-    """
-    - English (printed): Tesseract PSM 6; escalate if low confidence and intensive=True.
-    - English (handwritten): TrOCR if use_trocr=True; else Tesseract tuned for messy text.
-    - Arabic/Chinese: Tesseract PSM 4; escalate if low confidence and intensive=True.
-    """
     if preset == "English (printed)":
         text, conf = tesseract_ocr(page, base_zoom, "eng", psm_eng, True, True, True, 180, user_words_path, timeout_sec)
         if conf < 70 and intensive:
@@ -229,11 +221,10 @@ def ocr_strategy(
     text, _ = tesseract_ocr(page, base_zoom, "eng", "6", True, True, True, 180, user_words_path, timeout_sec)
     return text
 
-# ---------- Extractors ----------
+# ---------------- Extractors ----------------
 def extract_text_from_pdf(file_bytes, preset: str, user_words_path: Optional[str],
                           force_ocr: bool, intensive: bool, base_zoom: float,
                           use_trocr: bool, timeout_sec: int, max_pages: int = 0):
-    """Whole-document text; tries embedded first unless force_ocr, then strategy."""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     parts = []
     total = len(doc)
@@ -260,7 +251,6 @@ def extract_text_from_pdf(file_bytes, preset: str, user_words_path: Optional[str
 def extract_pages_with_metadata(file_bytes, document_name, preset: str, user_words_path: Optional[str],
                                 force_ocr: bool, intensive: bool, base_zoom: float,
                                 use_trocr: bool, timeout_sec: int, max_pages: int = 0):
-    """One chunk per page with {document_name, page_number, text} using strategy."""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     total = len(doc)
     limit = min(total, max_pages) if max_pages and max_pages > 0 else total
@@ -284,14 +274,14 @@ def extract_pages_with_metadata(file_bytes, document_name, preset: str, user_wor
     doc.close()
     return pages
 
-# ---------- Embeddings ----------
+# ---------------- Embeddings ----------------
 def embed_texts(model, texts):
     emb = model.encode(texts, batch_size=32, show_progress_bar=True)
     emb = np.asarray(emb, dtype=np.float32)
     emb /= (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
     return emb
 
-# ---------- OCR Presets & Options ----------
+# ---------------- OCR options UI ----------------
 with st.expander("⚙️ OCR Language & Options", expanded=True):
     preset = st.selectbox(
         "Language preset",
@@ -315,7 +305,7 @@ with st.expander("⚙️ OCR Language & Options", expanded=True):
         timeout_sec = st.slider("OCR timeout per page (sec)", 5, 60, 20)
         use_trocr = st.checkbox("Use handwriting engine (TrOCR) when preset = English (handwritten)", value=False)
 
-    # Optional vocabulary file (.txt only) — tucked behind a toggle
+    # Optional vocabulary file (.txt)
     user_words_path = None
     use_vocab = st.checkbox("Use custom vocabulary (.txt only)", value=False)
     if use_vocab:
@@ -327,7 +317,7 @@ with st.expander("⚙️ OCR Language & Options", expanded=True):
                 f.write(user_words_file.read())
             st.caption(f"Custom vocabulary saved to {user_words_path}")
 
-# ---------- STEP 1: Upload & Extract ----------
+# ---------------- STEP 1: Upload & Extract ----------------
 st.header("Step 1: Upload & Extract")
 uploaded_file = st.file_uploader("Choose a PDF file", type="pdf", key="pdf_uploader")
 
@@ -366,7 +356,7 @@ if uploaded_file:
                 st.error("PDF processing failed.")
                 st.exception(e)
 
-# ---------- STEP 2: Embed & Upload to Supabase ----------
+# ---------------- STEP 2: Embed & Upload to Supabase ----------------
 st.header("Step 2: Embed & Upload to Supabase")
 
 if not _supa:
@@ -387,6 +377,7 @@ else:
     if st.button("2) Generate embeddings & upload", type="primary"):
         try:
             if delete_first:
+                # Optional stored procedure you may have created; fallback to direct delete
                 try:
                     _ = _supa.rpc(
                         "delete_document", {"p_document_name": st.session_state.get("document_name", "")}
@@ -425,7 +416,7 @@ else:
                 if getattr(res, "data", None) is None:
                     st.error(
                         f"No data returned for batch {i+1}-{i+len(batch)}. "
-                        f"Check RLS (disable or add insert/select policies) and that the table exists."
+                        f"Check RLS (disable or add anon INSERT/SELECT policies) and that the table exists."
                     )
                     st.write(res)
                     st.stop()
@@ -442,7 +433,7 @@ else:
             st.error("Embedding or upload failed.")
             st.exception(e)
 
-# ---------- STEP 3: Search (Keyword / Semantic) ----------
+# ---------------- STEP 3: Search (Keyword / Semantic) ----------------
 st.header("Step 3: Search (Keyword / Semantic)")
 
 if not _supa:
@@ -476,7 +467,7 @@ else:
                 res = (
                     _supa.table("document_chunks")
                     .select("document_name,page_number,text")
-                    .order("id", desc=True)  # newest first (this kwarg is supported)
+                    .order("id", desc=True)  # newest first (valid kwarg)
                     .limit(3)
                     .execute()
                 )
@@ -533,7 +524,6 @@ else:
                         results = getattr(res, "data", []) or []
                         total = getattr(res, "count", None)
 
-                    # Final safety sort
                     results.sort(key=lambda r: (r.get("document_name", ""), r.get("page_number") or 0))
                     st.write(f"Matches found: {total if total is not None else len(results)}")
 
@@ -557,7 +547,6 @@ else:
                     results = getattr(res, "data", []) or []
                     results.sort(key=lambda r: (r.get("document_name", ""), r.get("page_number") or 0))
 
-                # Render results
                 if not results:
                     st.info("No results found.")
                 else:
@@ -574,11 +563,11 @@ else:
                 st.error("Search failed.")
                 st.exception(e)
 
-# ---------- Footer ----------
+# ---------------- Footer ----------------
 with st.expander("Free-tier tips"):
     st.markdown(
-        "- For quick tests on long PDFs, set **Limit pages** above to 5–10.\n"
-        "- English handwriting uses TrOCR; first load may take time. Only enable when needed.\n"
-        "- For Arabic/Chinese, keep **Intensive** ON and try zoom 3.5–4.0 if scans are poor.\n"
-        "- Supabase free DB (~500 MB) is fine for thousands of pages. Disable RLS or add anon policies."
+        "- For long PDFs, set **Limit pages** to 5–10 for a quick test.\n"
+        "- Use **English (handwritten)** + **TrOCR** only on pages that truly need it (heavier CPU).\n"
+        "- For Arabic/Chinese scans, keep **Intensive** ON and try zoom 3.5–4.0 if needed.\n"
+        "- Ensure RLS is disabled or anon policies allow INSERT/SELECT on `document_chunks`."
     )
