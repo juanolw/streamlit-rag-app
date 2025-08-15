@@ -1,8 +1,8 @@
-# app.py — RAG OCR/Search/QA with STRICT OCR mode (no guessing)
-# - Printed English (strict): Tesseract with dicts OFF + optional allowlist
-# - Handwritten English (strict): EasyOCR (non-generative), avoids hallucinations
-# - Non-strict keeps your previous behavior (Tesseract + optional TrOCR/booster)
-# - Search & QA unchanged; no .order(..., asc=) usage
+# app.py — RAG with Auto Page-Type Detection:
+# Digital text → keep embedded
+# Scanned printed → Tesseract (strict, no dictionary)
+# Handwriting overlays → EasyOCR (strict, non-generative) + merge with printed
+# Search & QA preserved. No .order(..., asc=) usage.
 
 import io
 import re
@@ -30,20 +30,20 @@ try:
 except Exception:
     partial_ratio = None
 
-# Optional EasyOCR for strict handwriting
+# Optional EasyOCR (handwriting/non-generative)
 EASYOCR_AVAILABLE = True
 try:
     import easyocr
 except Exception:
     EASYOCR_AVAILABLE = False
 
-BUILD_ID = "strict-ocr-no-guessing-2025-08-15"
+BUILD_ID = "auto-detect-mixed-pdf-2025-08-15"
 
 st.set_page_config(
-    page_title="RAG • OCR | Search | QA",
+    page_title="RAG • Auto OCR",
     page_icon="📚",
     layout="wide",
-    menu_items={"About": "RAG for Construction Claims — STRICT OCR (no guessing)"}
+    menu_items={"About": "RAG for Construction Claims — Auto detect digital/scanned/handwriting"}
 )
 
 # ---------------- Global CSS (single sleek tab bar) ----------------
@@ -109,40 +109,36 @@ with st.sidebar:
     st.markdown("---")
     st.header("OCR Options")
 
+    # NEW option: Auto detect mixed pages
     preset = st.selectbox(
         "Language preset",
-        ["English (printed)", "English (handwritten)", "Arabic (ara)", "Chinese (Simplified)", "Chinese (Traditional)"],
+        ["Auto (detect mixed)", "English (printed)", "English (handwritten)", "Arabic (ara)", "Chinese (Simplified)", "Chinese (Traditional)"],
         index=0
     )
 
-    # STRICT OCR switch
     strict_ocr = st.toggle(
         "Strict OCR (no guessing, no generative)", value=True,
-        help="Disables Tesseract dictionaries and TrOCR. For handwriting, uses EasyOCR (non-generative)."
+        help="Disables Tesseract dictionaries and TrOCR. Handwriting uses EasyOCR (non-generative)."
     )
 
-    default_zoom = 3.0 if preset == "English (printed)" else 3.5
+    default_zoom = 3.0 if preset in ("Auto (detect mixed)", "English (printed)") else 3.5
     base_zoom = st.slider("Render zoom (DPI proxy)", 2.0, 4.5, default_zoom, 0.5)
     timeout_sec = st.slider("OCR timeout per page (sec)", 5, 60, 20)
 
-    # TrOCR & booster only if NOT strict
+    # Only relevant if NOT strict (we keep for completeness)
     if not strict_ocr:
         use_trocr = st.checkbox("Use TrOCR for English (handwritten)", value=False)
-        handwriting_booster = st.checkbox(
-            "Handwriting booster (line-by-line TrOCR fallback)",
-            value=(preset == "English (handwritten)"),
-            help="Uses TrOCR on low-confidence lines; may 'clean up' noisy cursive."
-        )
+        handwriting_booster = st.checkbox("Handwriting booster (TrOCR line rescue)", value=False)
         booster_trigger_conf = st.slider("Booster trigger: line conf <", 0, 100, 65)
     else:
         use_trocr = False
         handwriting_booster = False
         booster_trigger_conf = 65
 
-    # Character allowlist (helps keep punctuation like 'Gen.')
+    # Character allowlist (preserves punctuation like "Gen.")
     default_allowlist = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,:;!?'\"-/()&%#@[]{}+*=°$|\\"
     use_allowlist = st.checkbox("Use character allowlist", value=True)
-    allowlist = st.text_input("Allowlist (kept as-is; helpful for strict OCR)", value=default_allowlist) if use_allowlist else None
+    allowlist = st.text_input("Allowlist", value=default_allowlist) if use_allowlist else None
 
     # Optional vocab for Tesseract (still non-generative)
     user_words_path = None
@@ -158,8 +154,8 @@ with st.sidebar:
     # QA thresholds
     st.markdown("---")
     st.header("QA Thresholds")
-    qa_min_conf = st.slider("Min OCR confidence to PASS", 0, 100, 60 if preset == "English (printed)" else 55)
-    qa_min_len  = st.slider("Min characters to PASS", 0, 300, 20 if preset == "English (printed)" else 15, step=5)
+    qa_min_conf = st.slider("Min OCR confidence to PASS", 0, 100, 60)
+    qa_min_len  = st.slider("Min characters to PASS", 0, 300, 20, step=5)
     qa_max_noisy= st.slider("Max non-alphanumeric ratio to PASS", 0.0, 1.0, 0.85, 0.01)
     st.session_state["qa_min_conf"]  = qa_min_conf
     st.session_state["qa_min_len"]   = qa_min_len
@@ -193,7 +189,7 @@ if _supa:
 # ---------------- Normalization & helpers ----------------
 ZW_REMOVE = dict.fromkeys(map(ord, "\u00ad\u200b\u200c\u200d\ufeff"), None)
 PUNCT_MAP = str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"', "–": "-", "—": "-", "\u00A0": " ", "·": " "})
-_PUNCT_STRIP_RE = re.compile(r"[,:;|/\\()\[\]{}<>•·…]+")  # NOTE: we KEEP . and - for raw text; normalized strips many
+_PUNCT_STRIP_RE = re.compile(r"[,:;|/\\()\[\]{}<>•·…]+")
 _SPACE_COLLAPSE_RE = re.compile(r"\s+")
 
 def normalize_text(s: str) -> str:
@@ -212,6 +208,7 @@ def escape_for_or_filter(s: str) -> str:
 def load_embedding_model():
     return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
+# -------- TrOCR (kept only for non-strict optional booster) --------
 @st.cache_resource(show_spinner=True)
 def load_trocr_handwritten():
     from transformers import TrOCRProcessor, VisionEncoderDecoderModel
@@ -222,14 +219,14 @@ def load_trocr_handwritten():
     device = torch.device("cpu"); model.to(device)
     return processor, model, device
 
+# -------- EasyOCR loader --------
 @st.cache_resource(show_spinner=True)
 def load_easyocr_reader(langs: List[str]):
-    # langs examples: ["en"], ["en","ar"], ["en","ch_sim"]
     if not EASYOCR_AVAILABLE:
         raise RuntimeError("easyocr is not installed. Add `easyocr` to requirements.txt")
     return easyocr.Reader(langs, gpu=False, verbose=False)
 
-# ---------------- OCR engines ----------------
+# ---------------- Page rendering ----------------
 def render_page_to_image(page, zoom: float = 3.0) -> Image.Image:
     mat = fitz.Matrix(zoom, zoom); pix = page.get_pixmap(matrix=mat, alpha=False)
     return Image.open(io.BytesIO(pix.tobytes("png")))
@@ -241,6 +238,7 @@ def preprocess_image(img: Image.Image, do_denoise=True, do_autocontrast=True, bi
     if binarize: img = img.point(lambda p: 255 if p > thresh else 0)
     return img
 
+# ---------------- Tesseract OCR ----------------
 def tesseract_ocr(
     page, zoom: float, lang: str, psm: str,
     user_words_path: Optional[str], timeout_sec: int = 20,
@@ -249,15 +247,11 @@ def tesseract_ocr(
     img = render_page_to_image(page, zoom=zoom)
     img = preprocess_image(img, True, True, True, 175, True)
 
-    # Base config
     config = f"--oem 1 --psm {psm} -c preserve_interword_spaces=1"
-    # STRICT: turn off dictionaries to avoid ‘Gen.’ => ‘German’
     if strict:
         config += " -c load_system_dawg=0 -c load_freq_dawg=0"
-        # Avoid character permutations on script words (safer)
         config += " -c language_model_penalty_non_dict_word=0 -c language_model_penalty_case_ok=0"
     if allowlist:
-        # keep your punctuation like period/dash/colon if in allowlist
         config += f' -c tessedit_char_whitelist="{allowlist}"'
     if user_words_path:
         config += f" --user-words {user_words_path}"
@@ -281,18 +275,17 @@ def tesseract_ocr(
             text = text2 or text
         except Exception:
             pass
-    return (text or "").strip(), avg_conf
+    return (text or "").strip(), float(avg_conf)
 
-def easyocr_ocr(
-    page, zoom: float, langs: List[str], allowlist: Optional[str] = None
-) -> Tuple[str, float]:
-    # Non-generative CTC OCR, returns text and average confidence
+# ---------------- EasyOCR (handwriting/overlay) ----------------
+def easyocr_ocr(page, zoom: float, langs: List[str], allowlist: Optional[str] = None) -> Tuple[str, float]:
     reader = load_easyocr_reader(langs)
     img = render_page_to_image(page, zoom=zoom).convert("RGB")
-    # detail=1 to get confidences
-    results = reader.readtext(np.array(img), detail=1, paragraph=True, decoder='greedy',
-                              allowlist=allowlist if allowlist else None)
-    # results: [(bbox, text, conf), ...]
+    results = reader.readtext(
+        np.array(img),
+        detail=1, paragraph=True, decoder='greedy',
+        allowlist=allowlist if allowlist else None
+    )
     texts, confs = [], []
     for item in results:
         if not isinstance(item, (list, tuple)) or len(item) < 3:
@@ -306,67 +299,43 @@ def easyocr_ocr(
     avg_conf = float(sum(confs) / len(confs)) if confs else 0.0
     return joined, avg_conf
 
-def trocr_ocr(page, zoom: float) -> str:
-    processor, model, device = load_trocr_handwritten()
-    import torch
-    img = render_page_to_image(page, zoom=zoom).convert("RGB")
-    with torch.no_grad():
-        inputs = processor(images=img, return_tensors="pt").to(device)
-        ids = model.generate(**inputs, max_length=512)
-        text = processor.batch_decode(ids, skip_special_tokens=True)[0]
-    return (text or "").strip()
-
-# (Optional) TrOCR line booster kept for non-strict mode only
-def ocr_page_handwriting_boosted(page, base_zoom: float, booster_trigger_conf: int, timeout_sec: int, user_words_path: Optional[str]) -> Dict[str, Any]:
-    zoom = max(3.5, base_zoom)
-    img = render_page_to_image(page, zoom=zoom).convert("RGB")
-    gray = ImageOps.autocontrast(img.convert("L"))
-    config = f"--oem 1 --psm 6 -c preserve_interword_spaces=1"
-    if user_words_path: config += f" --user-words {user_words_path}"
+# ---------------- Page analysis & merge ----------------
+def analyze_page(page) -> Dict[str, Any]:
+    """Look at embedded text length & number of images to decide path."""
     try:
-        data = pytesseract.image_to_data(gray, lang="eng", config=config, output_type=TessOutput.DICT, timeout=timeout_sec)
+        raw = page.get_text("rawdict") or {}
+        blocks = raw.get("blocks", [])
+        embed_chars = 0
+        for b in blocks:
+            if b.get("type") == 0:  # text block
+                for ln in b.get("lines", []):
+                    for sp in ln.get("spans", []):
+                        embed_chars += len(sp.get("text", ""))
     except Exception:
-        text = trocr_ocr(page, zoom); tn = normalize_text(text); avg = 70.0 if tn else 0.0
-        return dict(text=text, text_norm=tn, avg_conf=avg, ocr_engine="trocr", ocr_psm=None, ocr_zoom=float(zoom), ocr_attempts=1, flags=[])
-    n = len(data.get("text", []))
-    lines: Dict[tuple, Dict[str, Any]] = {}
-    for i in range(n):
-        txt = data["text"][i]
-        if not isinstance(txt, str) or not txt.strip(): continue
-        try: conf = int(data.get("conf", ["-1"]*n)[i])
-        except Exception: conf = -1
-        if conf < 0: continue
-        key = (data.get("block_num",[0]*n)[i], data.get("par_num",[0]*n)[i], data.get("line_num",[0]*n)[i])
-        l = int(data.get("left",[0]*n)[i]); t = int(data.get("top",[0]*n)[i])
-        w = int(data.get("width",[0]*n)[i]); h = int(data.get("height",[0]*n)[i])
-        e = lines.setdefault(key, dict(words=[], confs=[], l=l, t=t, r=l+w, b=t+h))
-        e["words"].append(txt.strip()); e["confs"].append(conf)
-        e["l"] = min(e["l"], l); e["t"] = min(e["t"], t); e["r"] = max(e["r"], l+w); e["b"] = max(e["b"], t+h)
+        embed_chars = 0
+    try:
+        image_count = len(page.get_images(full=True))
+    except Exception:
+        image_count = 0
+    return {"embed_chars": embed_chars, "image_count": image_count}
 
-    if not lines:
-        text = trocr_ocr(page, zoom); tn = normalize_text(text); avg = 70.0 if tn else 0.0
-        return dict(text=text, text_norm=tn, avg_conf=avg, ocr_engine="trocr", ocr_psm=None, ocr_zoom=float(zoom), ocr_attempts=1, flags=[])
-
-    processor, model, device = load_trocr_handwritten()
-    import torch
-    out_lines, line_confs = [], []
-    for _, ln in sorted(lines.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2])):
-        ltxt = " ".join(ln["words"]); lconf = float(sum(ln["confs"])) / max(len(ln["confs"]), 1)
-        if lconf < booster_trigger_conf:
-            margin = 4
-            l = max(0, ln["l"]-margin); t = max(0, ln["t"]-margin)
-            r = min(img.width, ln["r"]+margin); b = min(img.height, ln["b"]+margin)
-            crop = img.crop((l,t,r,b))
-            with torch.no_grad():
-                inputs = processor(images=crop, return_tensors="pt").to(device)
-                ids = model.generate(**inputs, max_length=256)
-                boosted = processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
-            if len(normalize_text(boosted)) > max(len(normalize_text(ltxt)), 3):
-                ltxt = boosted; lconf = max(lconf, 75.0)
-        out_lines.append(ltxt); line_confs.append(lconf)
-    combined = "\n".join(out_lines).strip(); tn = normalize_text(combined)
-    avg = float(sum(line_confs))/max(len(line_confs),1) if line_confs else 0.0
-    return dict(text=combined, text_norm=tn, avg_conf=avg, ocr_engine="tesseract+trocr-lines", ocr_psm=6, ocr_zoom=float(zoom), ocr_attempts=1, flags=[])
+def merge_texts_by_lines(base_text: str, add_text: str) -> str:
+    """Merge add_text lines that are not already present in base_text (by normalized lines)."""
+    if not add_text:
+        return base_text or ""
+    base_norm = normalize_text(base_text or "")
+    out_lines = (base_text or "").splitlines()
+    for line in (add_text or "").splitlines():
+        ln = line.strip()
+        if not ln:
+            continue
+        ln_norm = normalize_text(ln)
+        if len(ln_norm) < 3:
+            continue
+        if ln_norm not in base_norm:
+            out_lines.append(ln)
+            base_norm += " " + ln_norm  # grow corpus to avoid duplicates
+    return "\n".join(out_lines).strip()
 
 # ---------------- QA helpers ----------------
 def qc_metrics(text_norm: str) -> Dict[str, Any]:
@@ -374,14 +343,15 @@ def qc_metrics(text_norm: str) -> Dict[str, Any]:
     non_alnum_ratio = 1.0 - (alnum / n) if n else 1.0
     return {"text_len": n, "non_alnum_ratio": non_alnum_ratio}
 
-def get_thresholds_for(preset: str) -> Dict[str, Any]:
-    mc = st.session_state.get("qa_min_conf", 60 if preset == "English (printed)" else 55)
-    ml = st.session_state.get("qa_min_len",  20 if preset == "English (printed)" else 15)
-    mn = st.session_state.get("qa_max_noisy", 0.85)
-    return {"min_conf": mc, "min_len": ml, "max_noisy": mn}
+def thresholds() -> Dict[str, Any]:
+    return {
+        "min_conf": st.session_state.get("qa_min_conf", 60),
+        "min_len":  st.session_state.get("qa_min_len", 20),
+        "max_noisy":st.session_state.get("qa_max_noisy", 0.85),
+    }
 
-def make_flags(avg_conf: float, text_norm: str, preset: str) -> List[str]:
-    t = get_thresholds_for(preset); m = qc_metrics(text_norm)
+def make_flags(avg_conf: float, text_norm: str) -> List[str]:
+    t = thresholds(); m = qc_metrics(text_norm)
     flags = []
     if avg_conf < t["min_conf"]: flags.append("low_conf")
     if m["text_len"] < t["min_len"]: flags.append("very_short")
@@ -389,74 +359,95 @@ def make_flags(avg_conf: float, text_norm: str, preset: str) -> List[str]:
     if not text_norm: flags.append("empty")
     return flags
 
-# ---------------- OCR strategy ----------------
+# ---------------- Auto OCR strategy ----------------
 def ocr_page_auto(page, preset: str, user_words_path: Optional[str], base_zoom: float, timeout_sec: int,
                   use_trocr: bool, strict: bool, allowlist: Optional[str]) -> Dict[str, Any]:
     """
-    Returns dict {text, text_norm, avg_conf, ocr_engine, ocr_psm, ocr_zoom, ocr_attempts, flags}
+    Auto detect:
+      - If clearly digital: return embedded text
+      - If mixed/scan: Tesseract (printed) and possibly EasyOCR (handwriting); merge unique lines
     """
-    # STRICT paths — no generative models, no dictionary corrections expanding words
-    if strict:
-        if preset == "English (handwritten)":
-            if not EASYOCR_AVAILABLE:
-                st.warning("Strict handwriting selected but easyocr not installed. Falling back to Tesseract.")
-                text, conf = tesseract_ocr(page, max(3.5, base_zoom), "eng", "4", user_words_path, timeout_sec, strict=True, allowlist=allowlist)
+    info = analyze_page(page)
+    embed_text = (page.get_text() or "").strip()
+    embed_ok = (info["embed_chars"] >= 80 and info["image_count"] == 0)
+
+    if preset == "Auto (detect mixed)":
+        if embed_ok and not strict:
+            # Digital page with no images → keep embedded only
+            tn = normalize_text(embed_text); avg = 90.0
+            return dict(text=embed_text, text_norm=tn, avg_conf=avg, ocr_engine="embedded", ocr_psm=None, ocr_zoom=None, ocr_attempts=0, flags=make_flags(avg, tn))
+
+        # Otherwise, we will do OCR. Start with printed (Tesseract strict)
+        t_text, t_conf = tesseract_ocr(page, base_zoom, "eng", "6", user_words_path, timeout_sec, strict=True, allowlist=allowlist)
+        t_norm = normalize_text(t_text)
+
+        final_text = ""
+        confs = []
+        engine_parts = []
+
+        # If embedded exists and seems useful, include it as base then add OCR lines
+        if embed_text and len(normalize_text(embed_text)) >= 10:
+            final_text = embed_text
+            confs.append(90.0)
+            engine_parts.append("embedded")
+
+        # Add printed OCR if it brings value
+        if len(t_norm) >= 3:
+            if final_text:
+                final_text = merge_texts_by_lines(final_text, t_text)
             else:
-                text, conf = easyocr_ocr(page, max(3.5, base_zoom), langs=["en"], allowlist=allowlist)
-            tn = normalize_text(text); flags = make_flags(conf, tn, preset)
-            return dict(text=text, text_norm=tn, avg_conf=float(conf), ocr_engine="easyocr" if EASYOCR_AVAILABLE else "tesseract-strict",
-                        ocr_psm=None if EASYOCR_AVAILABLE else 4, ocr_zoom=max(3.5, base_zoom), ocr_attempts=1, flags=flags)
-        elif preset == "English (printed)":
-            text, conf = tesseract_ocr(page, base_zoom, "eng", "6", user_words_path, timeout_sec, strict=True, allowlist=allowlist)
-            tn = normalize_text(text); flags = make_flags(conf, tn, preset)
-            return dict(text=text, text_norm=tn, avg_conf=float(conf), ocr_engine="tesseract-strict", ocr_psm=6, ocr_zoom=base_zoom, ocr_attempts=1, flags=flags)
-        elif preset == "Arabic (ara)":
-            # Keep Tesseract; dictionary often helpful for Arabic. We do NOT disable dawgs by default here.
-            text, conf = tesseract_ocr(page, max(3.5, base_zoom), "ara", "4", user_words_path, timeout_sec, strict=False, allowlist=allowlist)
-            tn = normalize_text(text); flags = make_flags(conf, tn, preset)
-            return dict(text=text, text_norm=tn, avg_conf=float(conf), ocr_engine="tesseract", ocr_psm=4, ocr_zoom=max(3.5, base_zoom), ocr_attempts=1, flags=flags)
-        elif preset == "Chinese (Simplified)":
-            text, conf = tesseract_ocr(page, max(3.5, base_zoom), "chi_sim", "4", user_words_path, timeout_sec, strict=False, allowlist=None)
-            tn = normalize_text(text); flags = make_flags(conf, tn, preset)
-            return dict(text=text, text_norm=tn, avg_conf=float(conf), ocr_engine="tesseract", ocr_psm=4, ocr_zoom=max(3.5, base_zoom), ocr_attempts=1, flags=flags)
-        elif preset == "Chinese (Traditional)":
-            text, conf = tesseract_ocr(page, max(3.5, base_zoom), "chi_tra", "4", user_words_path, timeout_sec, strict=False, allowlist=None)
-            tn = normalize_text(text); flags = make_flags(conf, tn, preset)
-            return dict(text=text, text_norm=tn, avg_conf=float(conf), ocr_engine="tesseract", ocr_psm=4, ocr_zoom=max(3.5, base_zoom), ocr_attempts=1, flags=flags)
+                final_text = t_text
+            confs.append(float(t_conf))
+            engine_parts.append("tesseract-strict")
 
-    # NON-STRICT behavior (previous flexible pipeline)
-    if preset == "English (handwritten)" and st.session_state.get("handwriting_booster", False):
-        try:
-            cand = ocr_page_handwriting_boosted(page, base_zoom, st.session_state.get("booster_trigger_conf", 65), timeout_sec, user_words_path)
-            if len(cand.get("text_norm","")) >= st.session_state.get("qa_min_len", 20):
-                return cand
-        except Exception:
-            pass
+        # If page had images OR printed conf was modest, try handwriting overlay via EasyOCR
+        need_easy = (info["image_count"] > 0) or (t_conf < 70)
+        if need_easy and EASYOCR_AVAILABLE:
+            e_text, e_conf = easyocr_ocr(page, max(3.5, base_zoom), langs=["en"], allowlist=allowlist)
+            if len(normalize_text(e_text)) >= 3:
+                final_text = merge_texts_by_lines(final_text, e_text)
+                confs.append(float(e_conf))
+                engine_parts.append("easyocr")
 
-    if preset == "English (handwritten)" and use_trocr:
-        try:
-            text = trocr_ocr(page, zoom=max(3.0, base_zoom)); conf = 65.0
-            tn = normalize_text(text); flags = make_flags(conf, tn, preset)
-            return dict(text=text, text_norm=tn, avg_conf=conf, ocr_engine="trocr", ocr_psm=None, ocr_zoom=max(3.0, base_zoom), ocr_attempts=1, flags=flags)
-        except Exception:
-            pass
+        # Fallback if nothing useful yet: try Tesseract non-strict once
+        if not final_text.strip():
+            t2, c2 = tesseract_ocr(page, base_zoom+0.5, "eng", "4", user_words_path, timeout_sec, strict=False, allowlist=allowlist)
+            final_text = t2; confs.append(float(c2)); engine_parts.append("tesseract")
 
-    # Default Tesseract per preset
+        tn = normalize_text(final_text)
+        avg = float(np.mean(confs)) if confs else 0.0
+        return dict(text=final_text, text_norm=tn, avg_conf=avg, ocr_engine="+".join(engine_parts) or "none",
+                    ocr_psm=None, ocr_zoom=base_zoom, ocr_attempts=1, flags=make_flags(avg, tn))
+
+    # Non-auto presets behave as before (with strict toggles)
     if preset == "English (printed)":
-        text, conf = tesseract_ocr(page, base_zoom, "eng", "6", user_words_path, timeout_sec, strict=False, allowlist=allowlist)
-    elif preset == "English (handwritten)":
-        text, conf = tesseract_ocr(page, base_zoom+0.5, "eng", "4", user_words_path, timeout_sec, strict=False, allowlist=allowlist)
-    elif preset == "Arabic (ara)":
-        text, conf = tesseract_ocr(page, base_zoom, "ara", "4", user_words_path, timeout_sec, strict=False, allowlist=allowlist)
-    elif preset == "Chinese (Simplified)":
-        text, conf = tesseract_ocr(page, base_zoom, "chi_sim", "4", user_words_path, timeout_sec, strict=False, allowlist=None)
-    elif preset == "Chinese (Traditional)":
-        text, conf = tesseract_ocr(page, base_zoom, "chi_tra", "4", user_words_path, timeout_sec, strict=False, allowlist=None)
-    else:
-        text, conf = tesseract_ocr(page, base_zoom, "eng", "6", user_words_path, timeout_sec, strict=False, allowlist=allowlist)
+        text, conf = tesseract_ocr(page, base_zoom, "eng", "6", user_words_path, timeout_sec, strict=strict, allowlist=allowlist)
+        tn = normalize_text(text); return dict(text=text, text_norm=tn, avg_conf=float(conf), ocr_engine="tesseract" + ("-strict" if strict else ""), ocr_psm=6, ocr_zoom=base_zoom, ocr_attempts=1, flags=make_flags(conf, tn))
 
-    tn = normalize_text(text); flags = make_flags(conf, tn, preset)
-    return dict(text=text, text_norm=tn, avg_conf=float(conf), ocr_engine="tesseract", ocr_psm=None, ocr_zoom=base_zoom, ocr_attempts=1, flags=flags)
+    if preset == "English (handwritten)":
+        if strict and EASYOCR_AVAILABLE:
+            text, conf = easyocr_ocr(page, max(3.5, base_zoom), langs=["en"], allowlist=allowlist)
+            tn = normalize_text(text); return dict(text=text, text_norm=tn, avg_conf=float(conf), ocr_engine="easyocr", ocr_psm=None, ocr_zoom=max(3.5, base_zoom), ocr_attempts=1, flags=make_flags(conf, tn))
+        # non-strict fallback
+        text, conf = tesseract_ocr(page, base_zoom+0.5, "eng", "4", user_words_path, timeout_sec, strict=False, allowlist=allowlist)
+        tn = normalize_text(text); return dict(text=text, text_norm=tn, avg_conf=float(conf), ocr_engine="tesseract", ocr_psm=4, ocr_zoom=base_zoom+0.5, ocr_attempts=1, flags=make_flags(conf, tn))
+
+    if preset == "Arabic (ara)":
+        text, conf = tesseract_ocr(page, max(3.5, base_zoom), "ara", "4", user_words_path, timeout_sec, strict=False, allowlist=allowlist)
+        tn = normalize_text(text); return dict(text=text, text_norm=tn, avg_conf=float(conf), ocr_engine="tesseract", ocr_psm=4, ocr_zoom=max(3.5, base_zoom), ocr_attempts=1, flags=make_flags(conf, tn))
+
+    if preset == "Chinese (Simplified)":
+        text, conf = tesseract_ocr(page, max(3.5, base_zoom), "chi_sim", "4", user_words_path, timeout_sec, strict=False, allowlist=None)
+        tn = normalize_text(text); return dict(text=text, text_norm=tn, avg_conf=float(conf), ocr_engine="tesseract", ocr_psm=4, ocr_zoom=max(3.5, base_zoom), ocr_attempts=1, flags=make_flags(conf, tn))
+
+    if preset == "Chinese (Traditional)":
+        text, conf = tesseract_ocr(page, max(3.5, base_zoom), "chi_tra", "4", user_words_path, timeout_sec, strict=False, allowlist=None)
+        tn = normalize_text(text); return dict(text=text, text_norm=tn, avg_conf=float(conf), ocr_engine="tesseract", ocr_psm=4, ocr_zoom=max(3.5, base_zoom), ocr_attempts=1, flags=make_flags(conf, tn))
+
+    # default
+    text, conf = tesseract_ocr(page, base_zoom, "eng", "6", user_words_path, timeout_sec, strict=strict, allowlist=allowlist)
+    tn = normalize_text(text)
+    return dict(text=text, text_norm=tn, avg_conf=float(conf), ocr_engine="tesseract", ocr_psm=6, ocr_zoom=base_zoom, ocr_attempts=1, flags=make_flags(conf, tn))
 
 # ---------------- Extraction ----------------
 def extract_text_from_pdf(file_bytes, preset: str, user_words_path: Optional[str],
@@ -469,12 +460,8 @@ def extract_text_from_pdf(file_bytes, preset: str, user_words_path: Optional[str
     for i, page in enumerate(doc):
         if i >= limit: break
         try:
-            embedded = (page.get_text() or "").strip()
-            if embedded and not strict:
-                parts.append(embedded)
-            else:
-                cand = ocr_page_auto(page, preset, user_words_path, base_zoom, timeout_sec, use_trocr, strict, allowlist)
-                parts.append(cand["text"])
+            cand = ocr_page_auto(page, preset, user_words_path, base_zoom, timeout_sec, use_trocr, strict, allowlist)
+            parts.append(cand["text"])
         except Exception as e:
             parts.append(f"[Error reading page {i+1}: {e}]")
         finally:
@@ -492,22 +479,15 @@ def extract_pages_with_metadata(file_bytes, document_name, preset: str, user_wor
     for i, page in enumerate(doc):
         if i >= limit: break
         try:
-            embedded = (page.get_text() or "").strip()
-            if embedded and not strict:
-                text = embedded; tn = normalize_text(text); avg = 80.0
-                engine, psm, zoom, attempts = "embedded", None, None, 1
-            else:
-                cand = ocr_page_auto(page, preset, user_words_path, base_zoom, timeout_sec, use_trocr, strict, allowlist)
-                text, tn, avg = cand["text"], cand["text_norm"], cand["avg_conf"]
-                engine, psm, zoom, attempts = cand["ocr_engine"], cand["ocr_psm"], cand["ocr_zoom"], cand["ocr_attempts"]
-            m = qc_metrics(tn)
+            cand = ocr_page_auto(page, preset, user_words_path, base_zoom, timeout_sec, use_trocr, strict, allowlist)
+            m = qc_metrics(cand["text_norm"])
             rows.append({
                 "document_name": document_name, "page_number": i + 1,
-                "text": text, "text_norm": tn,
-                "avg_conf": float(avg), "text_len": int(m["text_len"]),
+                "text": cand["text"], "text_norm": cand["text_norm"],
+                "avg_conf": float(cand["avg_conf"]), "text_len": int(m["text_len"]),
                 "non_alnum_ratio": float(m["non_alnum_ratio"]),
-                "ocr_engine": engine, "ocr_psm": psm, "ocr_zoom": zoom, "ocr_attempts": attempts,
-                "ocr_flags": make_flags(avg, tn, preset), "lang_preset": preset,
+                "ocr_engine": cand["ocr_engine"], "ocr_psm": cand["ocr_psm"], "ocr_zoom": cand["ocr_zoom"], "ocr_attempts": cand["ocr_attempts"],
+                "ocr_flags": make_flags(cand["avg_conf"], cand["text_norm"]), "lang_preset": preset,
             })
         except Exception as e:
             rows.append({
@@ -531,7 +511,7 @@ def embed_texts(model, texts):
 
 # ---------------- Local search helpers ----------------
 def local_fuzzy_search(rows: List[Dict[str, Any]], query: str, top_k: int = 50) -> List[Dict[str, Any]]:
-    qn = normalize_text(query); 
+    qn = normalize_text(query)
     if not qn: return []
     results = []; use_rf = partial_ratio is not None
     tokens = [t for t in qn.split() if len(t) >= 3]
@@ -614,7 +594,7 @@ with tab_ingest:
                     max_pages=max_pages_each,
                 )
 
-                flagged = [p for p in pages if ("low_conf" in p["ocr_flags"] or "very_short" in p["ocr_flags"] or "noisy_text" in p["ocr_flags"] or "empty" in p["ocr_flags"])]
+                flagged = [p for p in pages if any(f in p["ocr_flags"] for f in ("low_conf","very_short","noisy_text","empty"))]
                 avg_conf_mean = float(np.mean([p["avg_conf"] for p in pages])) if pages else 0.0
                 summary = {
                     "document_name": docname, "pages": len(pages), "flagged": len(flagged),
@@ -633,7 +613,7 @@ with tab_ingest:
                             st.markdown(f"**Page {rec['page_number']}** — flags: {rec['ocr_flags']}  •  conf={rec['avg_conf']:.1f}")
                             preview = (rec["text"][:500] + ("..." if len(rec["text"]) > 500 else "")) or "_(empty)_"
                             st.write(preview)
-                            st.caption(f"engine={rec['ocr_engine']} psm={rec['ocr_psm']} zoom={rec['ocr_zoom']} attempts={rec['ocr_attempts']}")
+                            st.caption(f"engine={rec['ocr_engine']} zoom={rec['ocr_zoom']}")
                             st.divider()
 
                 file_prog.progress(0.25, text=f"{docname}: OCR complete ({len(pages)} pages).")
@@ -940,7 +920,7 @@ with tab_qa:
 st.markdown(
     f"""
 <div class="footer">
-  <div><strong>RAG for Construction Claims — Strict OCR</strong> (no guessing)</div>
+  <div><strong>RAG for Construction Claims — Auto OCR</strong> (digital/scan/handwriting detection)</div>
   <div>Build <code>{BUILD_ID}</code></div>
 </div>
 """,
