@@ -1,4 +1,5 @@
 # app.py — Single sleek tab bar (Apple-like), OCR → Embeddings → Supabase → Search + QA
+# Includes Handwriting Booster (line-by-line TrOCR), QA sliders, and batch ingest
 # Compatible with supabase-py >= 2.5 (no 'asc=' kwargs in .order())
 
 import io
@@ -27,7 +28,7 @@ try:
 except Exception:
     partial_ratio = None
 
-BUILD_ID = "one-bar-pro-with-QA-sliders-2025-08-14"
+BUILD_ID = "one-bar-pro-with-QA-and-handwriting-booster-2025-08-15"
 
 st.set_page_config(
     page_title="RAG • OCR | Search | QA",
@@ -148,6 +149,19 @@ with st.sidebar:
     timeout_sec = st.slider("OCR timeout per page (sec)", 5, 60, 20)
     use_trocr = st.checkbox("Use TrOCR for English (handwritten)", value=False)
 
+    # Handwriting booster (line-by-line TrOCR fallback)
+    handwriting_booster = st.checkbox(
+        "Handwriting booster (line-by-line TrOCR fallback)",
+        value=(preset == "English (handwritten)"),
+        help="Uses TrOCR on low-confidence lines; great for cursive/pen text."
+    )
+    booster_trigger_conf = st.slider(
+        "Booster trigger: line conf <", 0, 100, 65,
+        help="Lines below this Tesseract confidence get re-read with TrOCR."
+    )
+    st.session_state["handwriting_booster"] = handwriting_booster
+    st.session_state["booster_trigger_conf"] = booster_trigger_conf
+
     # Optional vocab
     user_words_path = None
     use_vocab = st.checkbox("Use custom vocabulary (.txt)", value=False)
@@ -159,7 +173,7 @@ with st.sidebar:
                 f.write(vf.read())
             st.caption(f"Custom vocab saved to {user_words_path}")
 
-    # -------- QA Threshold sliders (NEW) --------
+    # -------- QA Threshold sliders --------
     st.markdown("---")
     st.header("QA Thresholds")
     qa_min_conf = st.slider(
@@ -286,7 +300,6 @@ def qc_metrics(text_norm: str) -> Dict[str, Any]:
     return {"text_len": n, "non_alnum_ratio": non_alnum_ratio}
 
 def get_thresholds_for(preset: str) -> Dict[str, Any]:
-    # Use UI values if set; fall back to safe defaults
     mc = st.session_state.get("qa_min_conf", 60 if preset == "English (printed)" else 55)
     ml = st.session_state.get("qa_min_len",  20 if preset == "English (printed)" else 15)
     mn = st.session_state.get("qa_max_noisy", 0.85)
@@ -300,6 +313,127 @@ def make_flags(avg_conf: float, text_norm: str, preset: str) -> List[str]:
     if m["non_alnum_ratio"] > t["max_noisy"]: flags.append("noisy_text")
     if not text_norm: flags.append("empty")
     return flags
+
+# -------- Handwriting booster (line-by-line TrOCR) --------
+def ocr_page_handwriting_boosted(
+    page,
+    base_zoom: float,
+    booster_trigger_conf: int = 65,
+    timeout_sec: int = 20,
+    user_words_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    1) Render page (high DPI), light preprocess.
+    2) Tesseract -> word boxes + per-word conf.
+    3) Group into lines; low-conf lines go through TrOCR.
+    4) Stitch lines; compute synthetic avg_conf.
+    """
+    zoom = max(3.5, base_zoom)
+    img = render_page_to_image(page, zoom=zoom).convert("RGB")
+    gray = ImageOps.autocontrast(img.convert("L"))
+
+    config = f"--oem 1 --psm 6 -c preserve_interword_spaces=1"
+    if user_words_path: config += f" --user-words {user_words_path}"
+
+    try:
+        data = pytesseract.image_to_data(gray, lang="eng", config=config,
+                                         output_type=TessOutput.DICT, timeout=timeout_sec)
+    except Exception:
+        text = trocr_ocr(page, zoom)
+        text_norm = normalize_text(text)
+        avg_conf = 70.0 if text_norm else 0.0
+        return dict(
+            text=text, text_norm=text_norm, avg_conf=avg_conf,
+            ocr_engine="trocr", ocr_psm=None, ocr_zoom=float(zoom),
+            ocr_attempts=1, flags=make_flags(avg_conf, text_norm, "English (handwritten)")
+        )
+
+    n = len(data.get("text", []))
+    lines: Dict[Tuple[int,int,int], Dict[str, Any]] = {}
+    for i in range(n):
+        txt = data["text"][i]
+        if not isinstance(txt, str) or not txt.strip():
+            continue
+        try:
+            conf = int(data.get("conf", ["-1"] * n)[i])
+        except Exception:
+            conf = -1
+        if conf < 0:
+            continue
+        key = (data.get("block_num", [0]*n)[i],
+               data.get("par_num",   [0]*n)[i],
+               data.get("line_num",  [0]*n)[i])
+        left = int(data.get("left",  [0]*n)[i])
+        top  = int(data.get("top",   [0]*n)[i])
+        w    = int(data.get("width", [0]*n)[i])
+        h    = int(data.get("height",[0]*n)[i])
+
+        entry = lines.setdefault(key, dict(words=[], confs=[], l=left, t=top, r=left+w, b=top+h))
+        entry["words"].append(txt.strip())
+        entry["confs"].append(conf)
+        entry["l"] = min(entry["l"], left)
+        entry["t"] = min(entry["t"], top)
+        entry["r"] = max(entry["r"], left + w)
+        entry["b"] = max(entry["b"], top + h)
+
+    if not lines:
+        text = trocr_ocr(page, zoom)
+        text_norm = normalize_text(text)
+        avg_conf = 70.0 if text_norm else 0.0
+        return dict(
+            text=text, text_norm=text_norm, avg_conf=avg_conf,
+            ocr_engine="trocr", ocr_psm=None, ocr_zoom=float(zoom),
+            ocr_attempts=1, flags=make_flags(avg_conf, text_norm, "English (handwritten)")
+        )
+
+    processor, model, device = load_trocr_handwritten()
+    import torch
+
+    lines_sorted = sorted(lines.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2]))
+    out_lines: List[str] = []
+    line_confs: List[float] = []
+
+    for _, ln in lines_sorted:
+        line_text = " ".join([w for w in ln["words"] if w])
+        line_conf = float(sum(ln["confs"])) / max(len(ln["confs"]), 1)
+        boosted_text = None
+
+        if (line_conf < booster_trigger_conf) or (len(normalize_text(line_text)) < st.session_state.get("qa_min_len", 20)):
+            # Crop with a small margin
+            margin = 4
+            l = max(0, ln["l"] - margin); t = max(0, ln["t"] - margin)
+            r = min(img.width,  ln["r"] + margin); b = min(img.height, ln["b"] + margin)
+            crop = img.crop((l, t, r, b))
+
+            with torch.no_grad():
+                inputs = processor(images=crop, return_tensors="pt").to(device)
+                gen_ids = model.generate(**inputs, max_length=256)
+                boosted_text = processor.batch_decode(gen_ids, skip_special_tokens=True)[0].strip()
+
+            bt_norm = normalize_text(boosted_text or "")
+            lt_norm = normalize_text(line_text)
+            if len(bt_norm) > max(len(lt_norm), 3):
+                line_text = boosted_text
+                line_conf = max(line_conf, 75.0)  # synthetic conf for boosted lines
+
+        out_lines.append(line_text)
+        line_confs.append(line_conf)
+
+    combined = "\n".join(out_lines).strip()
+    combined_norm = normalize_text(combined)
+    avg_conf_all = float(sum(line_confs)) / max(len(line_confs), 1) if line_confs else 0.0
+    flags = make_flags(avg_conf_all, combined_norm, "English (handwritten)")
+
+    return dict(
+        text=combined,
+        text_norm=combined_norm,
+        avg_conf=avg_conf_all,
+        ocr_engine="tesseract+trocr-lines",
+        ocr_psm=6,
+        ocr_zoom=float(zoom),
+        ocr_attempts=1,
+        flags=flags,
+    )
 
 def ocr_variants_for_preset(preset: str, use_trocr: bool, base_zoom: float):
     if preset == "English (printed)":
@@ -325,6 +459,21 @@ def ocr_variants_for_preset(preset: str, use_trocr: bool, base_zoom: float):
 
 def ocr_page_auto(page, preset: str, user_words_path: Optional[str], base_zoom: float, timeout_sec: int,
                   use_trocr: bool, max_attempts: int = 3):
+    # Handwriting booster early path
+    if preset == "English (handwritten)" and st.session_state.get("handwriting_booster", False):
+        try:
+            cand = ocr_page_handwriting_boosted(
+                page,
+                base_zoom=base_zoom,
+                booster_trigger_conf=st.session_state.get("booster_trigger_conf", 65),
+                timeout_sec=timeout_sec,
+                user_words_path=user_words_path,
+            )
+            if len(cand.get("text_norm", "")) >= st.session_state.get("qa_min_len", 20):
+                return cand
+        except Exception:
+            pass
+
     variants = ocr_variants_for_preset(preset, use_trocr, base_zoom)[:max_attempts]
     best = None
     for idx, (engine, cfg) in enumerate(variants, 1):
@@ -531,7 +680,7 @@ with tab_ingest:
                     max_pages=max_pages_each,
                 )
 
-                # Summaries + flag breakdown (NEW)
+                # Flag summary
                 flagged = [
                     p for p in pages
                     if ("low_conf" in p["ocr_flags"]
@@ -581,11 +730,10 @@ with tab_ingest:
                     texts_batch: List[str] = []
                     rows_batch: List[Dict[str, Any]] = []
 
-                    # Helper: flush a batch and return how many were inserted
                     def flush_batch_return_count(texts_list: List[str], rows_list: List[Dict[str, Any]]) -> int:
                         if not texts_list:
                             return 0
-                        vecs = embed_texts(model, texts_list)  # normalized embeddings
+                        vecs = embed_texts(model, texts_list)
                         payload = []
                         for r, v in zip(rows_list, vecs):
                             payload.append({
@@ -613,11 +761,9 @@ with tab_ingest:
                         if len(texts_batch) >= batch_size:
                             inserted += flush_batch_return_count(texts_batch, rows_batch)
                             texts_batch, rows_batch = [], []
-                            # progress up to 0.90 while uploading
                             frac = 0.25 + 0.60 * (inserted / max(len(pages), 1))
                             file_prog.progress(min(0.90, frac), text=f"{docname}: uploading… {inserted}/{len(pages)}")
 
-                    # Final partial flush
                     inserted += flush_batch_return_count(texts_batch, rows_batch)
                     texts_batch, rows_batch = [], []
                     file_prog.progress(0.95, text=f"{docname}: uploaded {inserted} rows.")
@@ -822,7 +968,6 @@ with tab_qa:
         if list_btn:
             try:
                 q = _supa.table("document_chunks").select(
-                    # include ocr_flags (NEW)
                     "document_name,page_number,avg_conf,text_len,non_alnum_ratio,ocr_flags,ocr_engine,ocr_psm,ocr_zoom,ocr_attempts"
                 )
                 if sel_doc != "All": q = q.eq("document_name", sel_doc)
@@ -834,7 +979,6 @@ with tab_qa:
                     df = pd.DataFrame(rows); st.dataframe(df, use_container_width=True)
                     csv = df.to_csv(index=False).encode("utf-8")
                     st.download_button("Download CSV", data=csv, file_name="ocr_flagged_pages.csv", mime="text/csv")
-                    # Chart
                     try:
                         chart_df = (df.groupby("document_name", as_index=False).size()
                                       .rename(columns={"size": "flagged"})
@@ -880,7 +1024,8 @@ with tab_qa:
                             pno = row["page_number"]
                             if 1 <= pno <= len(doc):
                                 page = doc[pno - 1]
-                                cand = ocr_page_auto(page, preset, user_words_path, base_zoom, timeout_sec, use_trocr, max_attempts=4)
+                                cand = ocr_page_auto(page, preset, user_words_path, base_zoom,
+                                                     timeout_sec, use_trocr, max_attempts=4)
                                 vec = model.encode([cand["text"]])[0].astype(np.float32); vec /= (np.linalg.norm(vec) + 1e-12)
                                 m = qc_metrics(cand["text_norm"])
                                 _supa.table("document_chunks").update({
