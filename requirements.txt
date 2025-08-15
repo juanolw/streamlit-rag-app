@@ -2,14 +2,14 @@ streamlit==1.48.1
 pymupdf==1.26.3
 pytesseract==0.3.13
 Pillow==11.3.0
-sentence-transformers==5.1.0
 numpy==2.3.2
+pandas==2.3.1
+sentence-transformers==5.1.0
 supabase==2.5.1
-httpx==0.27.2
-transformers==4.55.2
-torch==2.8.0
-sentencepiece==0.2.1
-safetensors==0.6.2
 rapidfuzz==3.10.1
 easyocr==1.7.1
 opencv-python-headless==4.10.0.84
+scikit-image==0.25.2
+# Torch used by SentenceTransformers and EasyOCR (CPU wheels)
+torch==2.8.0
+torchvision==0.23.0
