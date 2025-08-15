@@ -3,9 +3,9 @@ tesseract-ocr-eng
 tesseract-ocr-ara
 tesseract-ocr-chi-sim
 tesseract-ocr-chi-tra
-tesseract-ocr-osd
+libgl1
 libglib2.0-0
 libsm6
-libxext6
 libxrender1
-libgl1
+libxext6
+libice6
