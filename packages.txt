@@ -1,12 +1,9 @@
-# Base OCR engine + languages
 tesseract-ocr
 tesseract-ocr-eng
 tesseract-ocr-ara
 tesseract-ocr-chi-sim
 tesseract-ocr-chi-tra
 tesseract-ocr-osd
-
-# Image libs some wheels expect on Debian
 libglib2.0-0
 libsm6
 libxext6
